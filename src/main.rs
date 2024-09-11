@@ -34,12 +34,14 @@ use ratatui::{
 const APPNAME:&str = "cuervo";
 
 struct App {
+    trim: bool,
+    alter: bool,
     show_goto: bool,
 }
 
 impl App {
     const fn new() -> Self {
-        Self { show_goto: false }
+        Self { trim: true, alter: false, show_goto: false }
     }
 }
 
@@ -82,6 +84,10 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     KeyCode::Char('q') => return Ok(()),
                     // Go to
                     KeyCode::Char('g') => app.show_goto = !app.show_goto,
+                    // Demonstrate trim bug
+                    KeyCode::Char('a') => app.trim = !app.trim,
+                    // Demonstrate trim bug
+                    KeyCode::Char('s') => app.alter = !app.alter,
                     _ => {}
                 }
             }
@@ -95,15 +101,16 @@ fn ui(f: &mut Frame, app: &App) {
     let vertical = Layout::vertical([Constraint::Percentage(100)]);
     let [content] = vertical.areas(area);
 
-    let text = format!("\nWelcome to {APPNAME}.\n\
-                        \n\
-                        Controls:\n\
-                        \x20\x20\x20\x20g: Go to URL.\n\
-                        \x20\x20\x20\x20q: Quit.");
+    let text = format!("\nWelcome to {APPNAME}.\n\nControls:\n\tg: Go to URL.\n\tq: Quit.");
 
-    let intro = Paragraph::new(text)
+    let intro = Paragraph::new(
+        if !app.alter
+            { text }
+        else
+            {"afwaoijfef ofeijfeaoi feoi".to_string()}
+)
         //.centered()
-        .wrap(Wrap { trim: false });
+        .wrap(Wrap { trim: app.trim });
 
     f.render_widget(intro, content);
 
