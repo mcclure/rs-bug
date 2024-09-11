@@ -85,9 +85,9 @@ fn run_app<B: Backend>(terminal: &mut Terminal<B>, mut app: App) -> io::Result<(
                     // Go to
                     KeyCode::Char('g') => app.show_goto = !app.show_goto,
                     // Demonstrate trim bug
-                    KeyCode::Char('a') => app.trim = !app.trim,
-                    // Demonstrate trim bug
-                    KeyCode::Char('s') => app.alter = !app.alter,
+                    KeyCode::Char('s') => app.trim = !app.trim,
+                    // Alternate text
+                    KeyCode::Char('a') => app.alter = !app.alter,
                     _ => {}
                 }
             }
