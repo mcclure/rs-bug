@@ -2,6 +2,7 @@ use crossterm::event::{DisableMouseCapture, EnableMouseCapture};
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use futures::StreamExt;
 use ratatui::backend::CrosstermBackend;
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::widgets::{Block, Borders};
@@ -501,7 +502,8 @@ impl Vim {
     }
 }
 
-fn main() -> io::Result<()> {
+#[tokio::main]
+async fn main() -> io::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
 
@@ -523,18 +525,31 @@ fn main() -> io::Result<()> {
     textarea.set_cursor_style(Mode::Normal.cursor_style());
     let mut vim = Vim::new(Mode::Normal);
 
-    loop {
-        term.draw(|f| f.render_widget(&textarea, f.area()))?;
+    const FRAMES_PER_SECOND:f32 = 60.0;
+    let period = std::time::Duration::from_secs_f32(1.0 / FRAMES_PER_SECOND);
+    let mut interval = tokio::time::interval(period);
+    let mut events = crossterm::event::EventStream::new();
+    let mut should_quit = false;
 
-        vim = match vim.transition(crossterm::event::read()?.into(), &mut textarea) {
-            Transition::Mode(mode) if vim.mode != mode => {
-                textarea.set_block(mode.block());
-                textarea.set_cursor_style(mode.cursor_style());
-                Vim::new(mode)
-            }
-            Transition::Nop | Transition::Mode(_) => vim,
-            Transition::Pending(input) => vim.with_pending(input),
-            Transition::Quit => break,
+    while !should_quit {
+        tokio::select! {
+            // FIXME: rather than this wait on mspc messages or something
+            // Used to this happened every loop
+            _ = interval.tick() => { term.draw(|f| f.render_widget(&textarea, f.area()))?; },
+
+            // Terminal event
+            Some(Ok(event)) = events.next() => {
+                vim = match vim.transition(event.into(), &mut textarea) {
+                    Transition::Mode(mode) if vim.mode != mode => {
+                        textarea.set_block(mode.block());
+                        textarea.set_cursor_style(mode.cursor_style());
+                        Vim::new(mode)
+                    }
+                    Transition::Nop | Transition::Mode(_) => vim,
+                    Transition::Pending(input) => vim.with_pending(input),
+                    Transition::Quit => { should_quit = true; vim },
+                }
+            },
         }
     }
 
