@@ -14,6 +14,33 @@ use std::io;
 use std::io::BufRead;
 use tui_textarea::{CursorMove, Input, Key, Scrolling, TextArea};
 
+// Audio help-- for ami
+use std::fmt::Display;
+use cpal::traits::{HostTrait, DeviceTrait, StreamTrait};
+use cpal::{Sample, FromSample, SizedSample};
+#[cfg(feature = "audio_log")]
+use std::io::Write; // Later we might want this for file writing.
+#[cfg(feature = "audio_log")]
+type AudioLog = std::fs::File;
+#[cfg(not(feature = "audio_log"))]
+type AudioLog = ();
+#[derive(Debug)]
+enum CpalError {
+    Build(cpal::BuildStreamError),
+    Play(cpal::PlayStreamError),
+    NoDevice,
+    Unknown
+}
+impl std::error::Error for CpalError {}
+impl Display for CpalError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{:?}", self)
+    }
+}
+impl From<cpal::BuildStreamError> for CpalError { fn from(e: cpal::BuildStreamError) -> Self { CpalError::Build(e) } }
+impl From<cpal::PlayStreamError> for CpalError { fn from(e: cpal::PlayStreamError) -> Self { CpalError::Play(e) } }
+// End audio help
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Mode {
     Normal,
@@ -502,10 +529,110 @@ impl Vim {
     }
 }
 
+fn audio_write<T>(output: &mut [T], channels: usize, next_sample: &mut dyn FnMut() -> f32, audio_log: &mut AudioLog)
+where
+    T: Sample + FromSample<f32> + bytemuck::Pod, /* Pod constraint can be removed without audio_log */
+{
+    // Chop output array into slices of size "channels"
+    for frame in output.chunks_mut(channels) {
+        let value: T = T::from_sample(next_sample());
+
+        // Take one sample and interleave it into all channels
+        for sample in frame.iter_mut() {
+            *sample = value;
+        }
+
+        #[cfg(feature = "audio_log")]
+        {
+            audio_log.write_all(bytemuck::cast_slice(&[value]));
+        }
+    }
+}
+
+fn audio_run<T>(device: &cpal::Device, config: &cpal::StreamConfig, audio_additional:()) -> Result<cpal::Stream, CpalError>
+where
+    T: SizedSample + FromSample<f32> + bytemuck::Pod, /* Pod constraint can be removed without audio_log */
+{
+//    let sample_rate = config.sample_rate.0 as f32;
+    let channels = config.channels as usize;
+    let mut counter = 0;
+
+    let mut next_value = move || {
+        counter += 1;
+        if 0 != counter % (1<<8) {
+            0.25
+        } else {
+            1.0
+        }
+        // -- BOILERPLATE --
+    };
+
+    let err_fn = |err| panic!("an error occurred on stream: {}", err); // FIXME: Geez don't panic
+
+    #[cfg(feature = "audio_log")]
+    let mut audio_log = std::fs::File::create("audio_log.raw").unwrap();
+    #[cfg(not(feature = "audio_log"))]
+    let mut audio_log:AudioLog = ();
+
+    let stream = device.build_output_stream(
+        config,
+        move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
+            audio_write(data, channels, &mut next_value, &mut audio_log)
+        },
+        err_fn,
+        None,
+    )?;
+    stream.play()?;
+
+    Ok(stream)
+}
+
+
+fn ami_boot_audio() -> Option<cpal::Stream> {
+    let host = cpal::default_host();
+    if let Some(device) = host.default_output_device() {
+        let config = device.default_output_config().unwrap();
+        let audio_additional = ();
+
+        let stream_result = match config.sample_format() {
+            cpal::SampleFormat::I8 => audio_run::<i8>(&device, &config.into(), audio_additional),
+            cpal::SampleFormat::I16 => audio_run::<i16>(&device, &config.into(), audio_additional),
+            // cpal::SampleFormat::I24 => audio_run::<I24>(&device, &config.into(), audio_additional),
+            cpal::SampleFormat::I32 => audio_run::<i32>(&device, &config.into(), audio_additional),
+            // cpal::SampleFormat::I48 => audio_run::<I48>(&device, &config.into(), audio_additional),
+            cpal::SampleFormat::I64 => audio_run::<i64>(&device, &config.into(), audio_additional),
+            cpal::SampleFormat::U8 => audio_run::<u8>(&device, &config.into(), audio_additional),
+            cpal::SampleFormat::U16 => audio_run::<u16>(&device, &config.into(), audio_additional),
+            // cpal::SampleFormat::U24 => audio_run::<U24>(&device, &config.into(), audio_additional),
+            cpal::SampleFormat::U32 => audio_run::<u32>(&device, &config.into(), audio_additional),
+            // cpal::SampleFormat::U48 => audio_run::<U48>(&device, &config.into(), audio_additional),
+            cpal::SampleFormat::U64 => audio_run::<u64>(&device, &config.into(), audio_additional),
+            cpal::SampleFormat::F32 => audio_run::<f32>(&device, &config.into(), audio_additional),
+            cpal::SampleFormat::F64 => audio_run::<f64>(&device, &config.into(), audio_additional),
+            sample_format => panic!("Unsupported sample format '{sample_format}'"),
+        };
+
+        match stream_result {
+            Err(e) => {
+                //warn!("Audio startup failure: {}", e); // TODO : logging
+                None
+            },
+            Ok(v) => {
+                //trace!("Audio startup success");
+                Some(v)
+            }
+        }
+    } else {
+        panic!("Failure: No audio device");
+        None
+    }
+}
+
 #[tokio::main]
 async fn main() -> io::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
+    let audio = ami_boot_audio();
 
     enable_raw_mode()?;
     crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
