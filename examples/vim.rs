@@ -559,10 +559,13 @@ where
 
     let mut next_value = move || {
         counter += 1;
-        if 0 != counter % (1<<8) {
+        let b0 = if 0 != counter & (1 << 14) { 1 } else { 0 };
+        let b1 = if 0 != counter & (1 << 15) { 1 } else { 0 };
+        let b2 = if 0 != counter & (1 << 16) { 2 } else { 0 };
+        if 0 != counter & (1<<(7 - b1 - b2 + b0)) {
             0.25
         } else {
-            1.0
+            0.0
         }
         // -- BOILERPLATE --
     };
