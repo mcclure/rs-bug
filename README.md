@@ -1,3 +1,5 @@
+This branch contains experimental and personal modifications by Andi McClure. These additions have not yet been released under any open source license.
+
 tui-textarea
 ============
 [![crate][crates-io-badge]][crate]
