@@ -39,6 +39,7 @@ impl Display for CpalError {
 }
 impl From<cpal::BuildStreamError> for CpalError { fn from(e: cpal::BuildStreamError) -> Self { CpalError::Build(e) } }
 impl From<cpal::PlayStreamError> for CpalError { fn from(e: cpal::PlayStreamError) -> Self { CpalError::Play(e) } }
+use std::sync::atomic::{AtomicU32, Ordering};
 // End audio help
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -94,17 +95,23 @@ enum Transition {
     Quit,
 }
 
+struct VimAudioSeed {
+    time: std::sync::Arc<AtomicU32>
+}
+
 // State of Vim emulation
 struct Vim {
     mode: Mode,
     pending: Input, // Pending input to handle a sequence with two keys like gg
+    audio:VimAudioSeed
 }
 
 impl Vim {
-    fn new(mode: Mode) -> Self {
+    fn new(mode: Mode, audio:VimAudioSeed) -> Self {
         Self {
             mode,
             pending: Input::default(),
+            audio
         }
     }
 
@@ -112,6 +119,7 @@ impl Vim {
         Self {
             mode: self.mode,
             pending,
+            audio: self.audio
         }
     }
 
@@ -529,6 +537,10 @@ impl Vim {
     }
 }
 
+struct AudioSeed {
+    time: std::sync::Arc<AtomicU32>
+}
+
 fn audio_write<T>(output: &mut [T], channels: usize, next_sample: &mut dyn FnMut() -> f32, audio_log: &mut AudioLog)
 where
     T: Sample + FromSample<f32> + bytemuck::Pod, /* Pod constraint can be removed without audio_log */
@@ -549,7 +561,7 @@ where
     }
 }
 
-fn audio_run<T>(device: &cpal::Device, config: &cpal::StreamConfig, audio_additional:()) -> Result<cpal::Stream, CpalError>
+fn audio_run<T>(device: &cpal::Device, config: &cpal::StreamConfig, audio_additional:AudioSeed) -> Result<cpal::Stream, CpalError>
 where
     T: SizedSample + FromSample<f32> + bytemuck::Pod, /* Pod constraint can be removed without audio_log */
 {
@@ -557,12 +569,23 @@ where
     let channels = config.channels as usize;
     let mut counter = 0;
 
+    let audio_time = audio_additional.time.clone();
+
     let mut next_value = move || {
         counter += 1;
-        let b0 = if 0 != counter & (1 << 14) { 1 } else { 0 };
-        let b1 = if 0 != counter & (1 << 15) { 1 } else { 0 };
-        let b2 = if 0 != counter & (1 << 16) { 2 } else { 0 };
-        if 0 != counter & (1<<(7 - b1 - b2 + b0)) {
+        let (is_b0, is_b1, is_b2) = (0 != counter & (1 << 14), 0 != counter & (1 << 15), 0 != counter & (1 << 16));
+
+        let b0 = if is_b0 {  1 } else { 0 };
+        let b1 = if is_b1 { -1 } else { 0 };
+        let b2 = if is_b2 { -2 } else { 0 };
+
+        let b0i = if is_b0 {  1 } else { 0 };
+        let b1i = if is_b1 {  2 } else { 0 };
+        let b2i = if is_b2 {  4 } else { 0 };
+
+        audio_time.store(b0i + b1i + b2i, Ordering::Relaxed);
+
+        if 0 != counter & (1<<(7 + b0 + b1 + b2)) {
             0.25
         } else {
             0.0
@@ -591,11 +614,10 @@ where
 }
 
 
-fn ami_boot_audio() -> Option<cpal::Stream> {
+fn ami_boot_audio(audio_additional:AudioSeed) -> Option<cpal::Stream> {
     let host = cpal::default_host();
     if let Some(device) = host.default_output_device() {
         let config = device.default_output_config().unwrap();
-        let audio_additional = ();
 
         let stream_result = match config.sample_format() {
             cpal::SampleFormat::I8 => audio_run::<i8>(&device, &config.into(), audio_additional),
@@ -635,7 +657,9 @@ fn ami_boot_audio() -> Option<cpal::Stream> {
 async fn main() -> io::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
-    let audio = ami_boot_audio();
+    let audio_time = std::sync::Arc::new(AtomicU32::new(0));
+    let audio_seed = AudioSeed { time: audio_time.clone() };
+    let audio = ami_boot_audio(audio_seed);
 
     enable_raw_mode()?;
     crossterm::execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -653,7 +677,7 @@ async fn main() -> io::Result<()> {
 
     textarea.set_block(Mode::Normal.block());
     textarea.set_cursor_style(Mode::Normal.cursor_style());
-    let mut vim = Vim::new(Mode::Normal);
+    let mut vim = Vim::new(Mode::Normal, VimAudioSeed { time:audio_time });
 
     const FRAMES_PER_SECOND:f32 = 60.0;
     let period = std::time::Duration::from_secs_f32(1.0 / FRAMES_PER_SECOND);
@@ -665,7 +689,16 @@ async fn main() -> io::Result<()> {
         tokio::select! {
             // FIXME: rather than this wait on mspc messages or something
             // Used to this happened every loop
-            _ = interval.tick() => { term.draw(|f| f.render_widget(&textarea, f.area()))?; },
+            _ = interval.tick() => { term.draw(|f| {
+                    f.render_widget(&textarea, f.area());
+
+                    let bar = ratatui::widgets::Paragraph::new(format!("TIME {}", (*vim.audio.time).load(Ordering::Relaxed)));
+                    let mut area = f.area();
+                    area.y = area.height-1;
+                    area.height=1;
+                    f.render_widget(bar, area);
+                })?;
+            },
 
             // Terminal event
             Some(Ok(event)) = events.next() => {
@@ -673,7 +706,7 @@ async fn main() -> io::Result<()> {
                     Transition::Mode(mode) if vim.mode != mode => {
                         textarea.set_block(mode.block());
                         textarea.set_cursor_style(mode.cursor_style());
-                        Vim::new(mode)
+                        Vim::new(mode, vim.audio)
                     }
                     Transition::Nop | Transition::Mode(_) => vim,
                     Transition::Pending(input) => vim.with_pending(input),
