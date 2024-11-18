@@ -39,7 +39,7 @@ impl Display for CpalError {
 }
 impl From<cpal::BuildStreamError> for CpalError { fn from(e: cpal::BuildStreamError) -> Self { CpalError::Build(e) } }
 impl From<cpal::PlayStreamError> for CpalError { fn from(e: cpal::PlayStreamError) -> Self { CpalError::Play(e) } }
-use std::sync::atomic::{AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
 // End audio help
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -96,7 +96,8 @@ enum Transition {
 }
 
 struct VimAudioSeed {
-    time: std::sync::Arc<AtomicU32>
+    time: std::sync::Arc<AtomicU32>,
+    play: std::sync::Arc<AtomicBool>
 }
 
 // State of Vim emulation
@@ -538,7 +539,8 @@ impl Vim {
 }
 
 struct AudioSeed {
-    time: std::sync::Arc<AtomicU32>
+    time: std::sync::Arc<AtomicU32>,
+    play: std::sync::Arc<AtomicBool>
 }
 
 fn audio_write<T>(output: &mut [T], channels: usize, next_sample: &mut dyn FnMut() -> f32, audio_log: &mut AudioLog)
@@ -570,6 +572,7 @@ where
     let mut counter = 0;
 
     let audio_time = audio_additional.time.clone();
+    let audio_playing = audio_additional.play.clone();
 
     let mut next_value = move || {
         counter += 1;
@@ -593,6 +596,8 @@ where
         // -- BOILERPLATE --
     };
 
+    let mut zero_value = || { 0.0 };
+
     let err_fn = |err| panic!("an error occurred on stream: {}", err); // FIXME: Geez don't panic
 
     #[cfg(feature = "audio_log")]
@@ -603,7 +608,13 @@ where
     let stream = device.build_output_stream(
         config,
         move |data: &mut [T], _: &cpal::OutputCallbackInfo| {
-            audio_write(data, channels, &mut next_value, &mut audio_log)
+            audio_write(data, channels,
+                if audio_playing.load(Ordering::Relaxed) {
+                    &mut next_value
+                } else {
+                    &mut zero_value
+                },
+            &mut audio_log)
         },
         err_fn,
         None,
@@ -658,7 +669,8 @@ async fn main() -> io::Result<()> {
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     let audio_time = std::sync::Arc::new(AtomicU32::new(0));
-    let audio_seed = AudioSeed { time: audio_time.clone() };
+    let audio_play = std::sync::Arc::new(AtomicBool::new(true));
+    let audio_seed = AudioSeed { time: audio_time.clone(), play: audio_play.clone() };
     let audio = ami_boot_audio(audio_seed);
 
     enable_raw_mode()?;
@@ -677,7 +689,7 @@ async fn main() -> io::Result<()> {
 
     textarea.set_block(Mode::Normal.block());
     textarea.set_cursor_style(Mode::Normal.cursor_style());
-    let mut vim = Vim::new(Mode::Normal, VimAudioSeed { time:audio_time });
+    let mut vim = Vim::new(Mode::Normal, VimAudioSeed { time:audio_time, play:audio_play.clone() }); // Note: time NOT cloned
 
     const FRAMES_PER_SECOND:f32 = 60.0;
     let period = std::time::Duration::from_secs_f32(1.0 / FRAMES_PER_SECOND);
@@ -692,7 +704,7 @@ async fn main() -> io::Result<()> {
             _ = interval.tick() => { term.draw(|f| {
                     f.render_widget(&textarea, f.area());
 
-                    let bar = ratatui::widgets::Paragraph::new(format!("TIME {}", (*vim.audio.time).load(Ordering::Relaxed)));
+                    let bar = ratatui::widgets::Paragraph::new(format!("{} {}", if (*vim.audio.play).load(Ordering::Relaxed) { "PLAYING" } else {"Paused "}, (*vim.audio.time).load(Ordering::Relaxed)));
                     let mut area = f.area();
                     area.y = area.height-1;
                     area.height=1;
@@ -702,15 +714,26 @@ async fn main() -> io::Result<()> {
 
             // Terminal event
             Some(Ok(event)) = events.next() => {
-                vim = match vim.transition(event.into(), &mut textarea) {
-                    Transition::Mode(mode) if vim.mode != mode => {
-                        textarea.set_block(mode.block());
-                        textarea.set_cursor_style(mode.cursor_style());
-                        Vim::new(mode, vim.audio)
+                match event.clone().into() { // Mode-indifferent overrides
+                    Input {
+                        key: Key::Char('p'),
+                        ctrl: true,
+                        ..
+                    } => {
+                        audio_play.fetch_xor(true, Ordering::Relaxed);
+                    },
+                    _ => { // Mode match
+                        vim = match vim.transition(event.into(), &mut textarea) {
+                            Transition::Mode(mode) if vim.mode != mode => {
+                                textarea.set_block(mode.block());
+                                textarea.set_cursor_style(mode.cursor_style());
+                                Vim::new(mode, vim.audio)
+                            }
+                            Transition::Nop | Transition::Mode(_) => vim,
+                            Transition::Pending(input) => vim.with_pending(input),
+                            Transition::Quit => { should_quit = true; vim },
+                        }
                     }
-                    Transition::Nop | Transition::Mode(_) => vim,
-                    Transition::Pending(input) => vim.with_pending(input),
-                    Transition::Quit => { should_quit = true; vim },
                 }
             },
         }
