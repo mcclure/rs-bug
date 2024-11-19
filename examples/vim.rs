@@ -48,6 +48,7 @@ enum Mode {
     Insert,
     Replace(bool), // Bool for "once only?"
     Visual,
+    Command, // "colon mode", what the manual calls Command-line mode
     Operator(char),
 }
 
@@ -58,6 +59,7 @@ impl Mode {
             Self::Replace(_) | Self::Insert => "type Esc to back to normal mode",
             Self::Visual => "type y to yank, type d to delete, type Esc to back to normal mode",
             Self::Operator(_) => "move cursor to apply operator",
+            Self::Command => "enter command at prompt, or Esc for normal mode",
         };
         let title = format!("{} MODE ({})", self, help);
         Block::default().borders(Borders::ALL).title(title)
@@ -70,6 +72,8 @@ impl Mode {
             Self::Visual => Color::LightYellow,
             Self::Replace(_) => Color::LightRed,
             Self::Operator(_) => Color::LightGreen,
+            // FIXME: This matches behavior of vim, would it be better to underline or something?
+            Self::Command => { return Style::default(); }
         };
         Style::default().fg(color).add_modifier(Modifier::REVERSED)
     }
@@ -83,6 +87,7 @@ impl fmt::Display for Mode {
             Self::Visual => write!(f, "VISUAL"),
             Self::Replace(_) => write!(f, "REPLACE"),
             Self::Operator(c) => write!(f, "OPERATOR({})", c),
+            Self::Command => write!(f, "COMMAND"),
         }
     }
 }
@@ -134,7 +139,7 @@ impl Vim {
         cursor_char < line_length
     }
 
-    fn transition(&self, input: Input, textarea: &mut TextArea<'_>) -> Transition {
+    fn transition(&self, input: Input, textarea: &mut TextArea<'_>, command: &mut TextArea<'_>) -> Transition {
         if input.key == Key::Null {
             return Transition::Nop;
         }
@@ -380,7 +385,7 @@ impl Vim {
                         key: Key::Char('f'),
                         ctrl: true,
                         ..
-                    } => textarea.scroll(Scrolling::PageDown),
+                    } => textarea.scroll(Scrolling::PageDown), // FIXME but don't scroll below end
                     Input {
                         key: Key::Char('b'),
                         ctrl: true,
@@ -482,6 +487,18 @@ impl Vim {
                         textarea.cut();
                         return Transition::Mode(Mode::Insert);
                     }
+                    Input {
+                        key: Key::Char(':'),
+                        ..
+                    } => {
+                        // Notice selection is not canceled
+                        // TODO: Factor out
+                        command.cancel_selection();
+                        command.move_cursor(CursorMove::Jump(0,0));
+                        while command.delete_line_by_end() {} // Erase until it fails to erase
+
+                        return Transition::Mode(Mode::Command);
+                    }
                     input => return Transition::Pending(input),
                 }
 
@@ -533,7 +550,28 @@ impl Vim {
                         Transition::Mode(Mode::Replace(false))
                     }
                 }
-            }
+            },
+            Mode::Command => match input {
+                // Exit command mode abnormally
+                Input { key: Key::Esc, .. }
+                | Input {
+                    key: Key::Char('c'),
+                    ctrl: true,
+                    ..
+                } => Transition::Mode(Mode::Normal),
+                // Investigate history
+                // TODO either scroll history or at least beep
+                Input { key: Key::Up, .. }
+                | Input { key: Key::Down, .. } => Transition::Mode(Mode::Command),
+                // Enter command successfully
+                Input { key: Key::Enter, .. }
+                    /* TODO actually process line here */ => Transition::Mode(Mode::Normal),
+                // Type into command buffer
+                _ => {
+                    command.input(input);
+                    Transition::Mode(Mode::Command)
+                }
+            },
         }
     }
 }
@@ -678,6 +716,7 @@ async fn main() -> io::Result<()> {
     let backend = CrosstermBackend::new(stdout);
     let mut term = Terminal::new(backend)?;
 
+    // This will be the file edit area.
     let mut textarea = if let Some(path) = env::args().nth(1) {
         let file = fs::File::open(path)?;
         io::BufReader::new(file)
@@ -689,6 +728,12 @@ async fn main() -> io::Result<()> {
 
     textarea.set_block(Mode::Normal.block());
     textarea.set_cursor_style(Mode::Normal.cursor_style());
+
+    // This is the command-line-mode :entry box, which is only sometimes visible.
+    let mut command = TextArea::default();
+    command.set_block(Block::default().borders(Borders::NONE));
+    command.set_cursor_style(Style::default().fg(Color::Reset).add_modifier(Modifier::REVERSED));
+
     let mut vim = Vim::new(Mode::Normal, VimAudioSeed { time:audio_time, play:audio_play.clone() }); // Note: time NOT cloned
 
     const FRAMES_PER_SECOND:f32 = 60.0;
@@ -703,12 +748,21 @@ async fn main() -> io::Result<()> {
             // Used to this happened every loop
             _ = interval.tick() => { term.draw(|f| {
                     f.render_widget(&textarea, f.area());
+                    let mut bottom_line_area = f.area();
+                    bottom_line_area.y = bottom_line_area.height-1;
+                    bottom_line_area.height=1;
 
-                    let bar = ratatui::widgets::Paragraph::new(format!("{} {}", if (*vim.audio.play).load(Ordering::Relaxed) { "PLAYING" } else {"Paused "}, (*vim.audio.time).load(Ordering::Relaxed)));
-                    let mut area = f.area();
-                    area.y = area.height-1;
-                    area.height=1;
-                    f.render_widget(bar, area);
+                    if vim.mode.clone() == Mode::Command {
+                        let bar = ratatui::widgets::Paragraph::new(":");
+                        f.render_widget(bar, bottom_line_area);
+
+                        bottom_line_area.x += 1;
+                        bottom_line_area.width -= 1;
+                        f.render_widget(&command, bottom_line_area);
+                    } else {
+                        let bar = ratatui::widgets::Paragraph::new(format!("{} {}", if (*vim.audio.play).load(Ordering::Relaxed) { "PLAYING" } else {"Paused "}, (*vim.audio.time).load(Ordering::Relaxed)));
+                        f.render_widget(bar, bottom_line_area);
+                    }
                 })?;
             },
 
@@ -723,7 +777,7 @@ async fn main() -> io::Result<()> {
                         audio_play.fetch_xor(true, Ordering::Relaxed);
                     },
                     _ => { // Mode match
-                        vim = match vim.transition(event.into(), &mut textarea) {
+                        vim = match vim.transition(event.into(), &mut textarea, &mut command) {
                             Transition::Mode(mode) if vim.mode != mode => {
                                 textarea.set_block(mode.block());
                                 textarea.set_cursor_style(mode.cursor_style());
