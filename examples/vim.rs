@@ -797,10 +797,20 @@ fn ami_boot_audio(audio_additional:AudioSeed) -> Option<cpal::Stream> {
 
 #[tokio::main]
 async fn main() -> io::Result<()> {
+    use clap::Parser;
+
+    #[derive(Parser)]
+    struct Cli {
+        #[arg(long = "play")]
+        play: bool,
+        filename: Option<String>
+    }
+    let cli = Cli::parse();
+
     let stdout = io::stdout();
     let mut stdout = stdout.lock();
     let audio_time = std::sync::Arc::new(AtomicU32::new(0));
-    let audio_play = std::sync::Arc::new(AtomicBool::new(true));
+    let audio_play = std::sync::Arc::new(AtomicBool::new(cli.play));
     let audio_seed = AudioSeed { time: audio_time.clone(), play: audio_play.clone() };
     let audio = ami_boot_audio(audio_seed);
 
@@ -810,7 +820,7 @@ async fn main() -> io::Result<()> {
     let mut term = Terminal::new(backend)?;
 
     // This will be the file edit area.
-    let mut textarea = if let Some(path) = env::args().nth(1) {
+    let mut textarea = if let Some(path) = cli.filename {
         let file = fs::File::open(path)?;
         io::BufReader::new(file)
             .lines()

@@ -115,6 +115,7 @@ cpal = "*"
 tokio = {version = "*", features = ["rt", "macros", "time", "rt-multi-thread"]}
 futures = "0.3.30"
 bytemuck = "*"
+clap = { version = "4.0.*" , features = ["derive"] }
 
 [package.metadata.docs.rs]
 targets = ["x86_64-unknown-linux-gnu"]
