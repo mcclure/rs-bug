@@ -55,7 +55,7 @@ enum Mode {
 impl Mode {
     fn block<'a>(&self) -> Block<'a> {
         let help = match self {
-            Self::Normal => "type q to quit, type i to enter insert mode",
+            Self::Normal => "type :q to quit, type i to enter insert mode",
             Self::Replace(_) | Self::Insert => "type Esc to back to normal mode",
             Self::Visual => "type y to yank, type d to delete, type Esc to back to normal mode",
             Self::Operator(_) => "move cursor to apply operator",
@@ -100,9 +100,76 @@ enum Transition {
     Quit,
 }
 
+// For ami
 struct VimAudioSeed {
     time: std::sync::Arc<AtomicU32>,
     play: std::sync::Arc<AtomicBool>
+}
+
+enum CommandLineTotality {
+    Auto,
+    All,
+    Buffer,
+}
+
+enum CommandLineSetType {
+    On,
+    Off,
+    Question
+}
+
+enum CommandLine {
+    Wqae(bool, bool, CommandLineTotality, bool), // Write, Quit, All/Buffer, Exclamation
+    Help(String),
+    Set(String, CommandLineSetType), // What you set, what you set it to // TODO: Local?
+    Beep
+//    Play(Option<u32>)
+//    Split(Option<String>), // Filename
+}
+
+fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXME: &String?
+    use pom::utf8::*;
+
+    fn space<'a>() -> Parser<'a, ()> {
+        one_of(" \t").repeat(0..).discard()
+    }
+
+    fn unspace<'a>() -> Parser<'a, ()> {
+        none_of(" \t").repeat(0..).discard()
+    }
+
+    // wqa! . Gets its own breakout cuz it's complicated
+    let wqae = (
+            ( // one of w or q must be present
+                seq("q").map(|_|(false, true)) // q by itself
+                | (                            // w or wq
+                    seq("w").map(|_|(true)) +
+                    seq("q").opt().map(|x|x.is_some())
+                  )
+            ) + ( // a/all, or b/buffer?
+                (seq("a") * seq("ll").opt() ).map(|_|CommandLineTotality::All)
+                | (seq("b") * seq("uffer").opt() ).map(|_|CommandLineTotality::Buffer)
+            ).opt().map(|x|x.unwrap_or(CommandLineTotality::Auto))
+            + seq("!").opt().map(|x|x.is_some()) // Force?
+        ).map(|(((a,b),c),d)| CommandLine::Wqae(a,b,c,d));
+
+    let parser =
+        wqae
+
+        | (seq("help") * space() * unspace().collect().map(|x| CommandLine::Help(x.to_string())))
+
+        | (seq("set") * space()) * (
+                unspace().collect() +
+                (space() * (
+                    seq("0").map(|_|CommandLineSetType::Off)
+                    | seq("1").map(|_|CommandLineSetType::On)
+                    | seq("?").map(|_|CommandLineSetType::Question)
+                ))
+            ).map(|(s,t)|CommandLine::Set(s.to_string(), t))
+
+        | (seq("beep").map(|_| CommandLine::Beep))
+    ;
+    parser.parse_str(&input)
 }
 
 // State of Vim emulation
@@ -119,6 +186,10 @@ impl Vim {
             pending: Input::default(),
             audio
         }
+    }
+
+    fn beep(&self) { // TODO: offer CPAL, blink options? // Note: Takes self but doesn't use it (yet?)
+        print!("\x07");
     }
 
     fn with_pending(self, pending: Input) -> Self {
@@ -223,7 +294,7 @@ impl Vim {
                         } else { // In regular vim, joining on the final line is a noop
                             let (c1, c2) = cursor;
                             textarea.move_cursor(CursorMove::Jump(c1 as u16, c2 as u16));
-                            // TODO: beep
+                            self.beep();
                         }
                     }
                     Input {
@@ -357,10 +428,13 @@ impl Vim {
                         return Transition::Mode(Mode::Replace(false));
                     }
 
+                    /*
+                    // You're not getting out so easily
                     Input {
                         key: Key::Char('q'),
                         ..
                     } => return Transition::Quit,
+                    */
                     Input {
                         key: Key::Char('e'),
                         ctrl: true,
@@ -562,10 +636,29 @@ impl Vim {
                 // Investigate history
                 // TODO either scroll history or at least beep
                 Input { key: Key::Up, .. }
-                | Input { key: Key::Down, .. } => Transition::Mode(Mode::Command),
+                | Input { key: Key::Down, .. } => {
+                    self.beep();
+                    Transition::Mode(Mode::Command)
+                },
                 // Enter command successfully
-                Input { key: Key::Enter, .. }
-                    /* TODO actually process line here */ => Transition::Mode(Mode::Normal),
+                Input { key: Key::Enter, .. } => {
+                    // Process line… this is heaviweight and maybe should be its own Thing
+                    let line0 = command.lines()[0].clone();
+                    let entry = parse_command_line(line0);
+
+                    match entry { // Notice: Currently w not supported
+                        Ok(CommandLine::Wqae(false, q, _totality, _exclamation)) => {
+                            if q {
+                                return Transition::Quit; // Short circuit?
+                            }
+                        },
+                        _ => {
+                            self.beep(); // TODO print useful message
+                        }
+                    }
+
+                    Transition::Mode(Mode::Normal)
+                },
                 // Type into command buffer
                 _ => {
                     command.input(input);
