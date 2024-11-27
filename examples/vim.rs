@@ -847,6 +847,8 @@ where
     }
 }
 
+const BPM:i32 = 110;
+
 fn audio_run<T>(device: &cpal::Device, config: &cpal::StreamConfig, audio_additional:AudioSeed) -> Result<cpal::Stream, CpalError>
 where
     T: SizedSample + FromSample<f32> + bytemuck::Pod, /* Pod constraint can be removed without audio_log */
@@ -854,25 +856,34 @@ where
 //    let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
     let mut counter = 0;
+    let mut beat_counter = 0;
+    let mut beat_idx = 0;
+    let mut high = false;
 
     let audio_time = audio_additional.time.clone();
     let audio_playing = audio_additional.play.clone();
+    let audio_song = audio_additional.song.clone();
+
+    let spq = (60.0*48000.0/(BPM as f64)/4.0).floor() as i32;
+
+    let square_periods:Vec<_> = vec![110, 220, 440].into_iter().map(|x|48000/x).collect();
 
     let mut next_value = move || {
         counter += 1;
-        let (is_b0, is_b1, is_b2) = (0 != counter & (1 << 14), 0 != counter & (1 << 15), 0 != counter & (1 << 16));
+        beat_counter += 1;
+        if beat_counter > spq {
+            beat_idx += 1;
+            beat_counter = 0;
+        }
 
-        let b0 = if is_b0 {  1 } else { 0 };
-        let b1 = if is_b1 { -1 } else { 0 };
-        let b2 = if is_b2 { -2 } else { 0 };
+        if counter > square_periods[beat_idx % square_periods.len()] {
+            high = !high;
+            counter = 0;
+        }
 
-        let b0i = if is_b0 {  1 } else { 0 };
-        let b1i = if is_b1 {  2 } else { 0 };
-        let b2i = if is_b2 {  4 } else { 0 };
+        audio_time.store(beat_idx as u32, Ordering::Relaxed);
 
-        audio_time.store(b0i + b1i + b2i, Ordering::Relaxed);
-
-        if 0 != counter & (1<<(7 + b0 + b1 + b2)) {
+        if high {
             0.25
         } else {
             0.0
