@@ -890,7 +890,7 @@ where
             for _y in 0..12 {
                 // TODO use real sample rate
                 let period = (SQUARE_RADIX as f64*44100.0_f64/freq/2.0).floor() as i32; // div two because half cycles
-                eprintln!("{}: {freq} = {period}", notes.len());
+                //eprintln!("{}: {freq} = {period}", notes.len());
                 notes.push(period);
                 freq *= semitone;
             }
@@ -1110,7 +1110,8 @@ async fn main() -> io::Result<()> {
                                         all = all + line;
                                     }
                                     let all = textarea.lines().join("\n");
-                                    let song = parse_language(all);
+                                    let song = if all.len() > 0 {parse_language(all)}
+                                        else { Ok(Default::default()) }; // Empty string is valid
                                     //eprintln!("D: {:?}", song.clone());
                                     match song {
                                         Ok(song) =>
