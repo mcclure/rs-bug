@@ -136,10 +136,18 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     }
 
     fn positive<'a>() -> Parser<'a, i32> {
-        let integer = (one_of("123456789").discard() * one_of("0123456789").discard().repeat(0..)).discard()
+        let integer = (sym('-').discard().opt() * one_of("123456789").discard() * one_of("0123456789").discard().repeat(0..)).discard()
             | sym('0').discard();
 //      let integer = digit.discard().repeat(1..);
-        integer.collect().convert(|x| x.parse::<i32>())
+        integer.collect().convert(|x| x.parse::<i32>().map(
+            |x| x + 69 - 12 // TODO: Remove -12 when it's easier to shift octave
+        ).map(
+            |x| if x >= 0 && x < 128 { x } else { 0 } // Rest on illegal notes
+        ) )
+    }
+
+    fn note<'a>() -> Parser<'a, i32> {
+        sym('x').map(|_|0) | positive()
     }
 
 //    let upper = one_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
@@ -147,7 +155,7 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     // wqa! . Gets its own breakout cuz it's complicated
     let parser =
         opt_space() *
-        (positive() + (space() * positive()).repeat(0..)).map(|(val, vec)|{
+        (note() + (space() * note()).repeat(0..)).map(|(val, vec)|{
             let mut result = vec![val];
             result.extend(vec);
             result
