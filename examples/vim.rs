@@ -865,19 +865,23 @@ where
     let audio_playing = audio_additional.play.clone();
     let audio_song = audio_additional.song.clone();
 
-    let mut song:Song = vec![];
+    let mut song:Song = vec![0];
 
+    let SQUARE_RADIX:i32 = 32; // Fixed point for better accuracy
+
+    // FIXME: These are slightly detuned from the A440 I find on youtube
     let notes = {
         let mut notes:Vec<i32> = Default::default();
         let mut base_freq = 440.0 / 32.0;
         let semitone = (2.0_f64).powf(1.0/12.0);
-        for _ in 0..=8 { // I REFUSE to play notes below MIDI 8. I just DON'T WANT TO BOTHER.
+        for _ in 0..=8 { // I REFUSE to play notes below MIDI 9. I just DON'T WANT TO BOTHER.
             notes.push(0x7FFFFFFF);
         }
         for _x in 0..=9 { // Nine octaves above that. Whatever
             let mut freq = base_freq;
             for _y in 0..12 {
-                let period = (48000.0_f64/freq/2.0).floor() as i32; // div two because half cycles
+                // TODO use real sample rate
+                let period = (SQUARE_RADIX as f64*44100.0_f64/freq/2.0).floor() as i32; // div two because half cycles
                 eprintln!("{}: {freq} = {period}", notes.len());
                 notes.push(period);
                 freq *= semitone;
@@ -890,7 +894,7 @@ where
     let spq = (60.0*48000.0/(BPM as f64)/4.0).floor() as i32;
 
     let mut next_value = move || {
-        counter += 1;
+        counter += SQUARE_RADIX;
         beat_counter += 1;
 
         if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
@@ -913,7 +917,7 @@ where
 
         if counter > period {
             high = !high;
-            counter = 0;
+            counter -= period;
         }
 
         audio_time.store(beat_idx as u32, Ordering::Relaxed);
