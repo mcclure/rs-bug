@@ -40,6 +40,7 @@ impl Display for CpalError {
 impl From<cpal::BuildStreamError> for CpalError { fn from(e: cpal::BuildStreamError) -> Self { CpalError::Build(e) } }
 impl From<cpal::PlayStreamError> for CpalError { fn from(e: cpal::PlayStreamError) -> Self { CpalError::Play(e) } }
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use atomicbox::AtomicOptionBox;
 // End audio help
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -104,7 +105,7 @@ enum Transition {
 // For ami
 struct VimAudioSeed {
     time: std::sync::Arc<AtomicU32>,
-    play: std::sync::Arc<AtomicBool>
+    play: std::sync::Arc<AtomicBool>,
 }
 
 // Language
@@ -127,11 +128,11 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     use pom::utf8::*;
 
     fn opt_space<'a>() -> Parser<'a, ()> {
-        one_of(" \t").repeat(0..).discard()
+        one_of(" \t\r\n").repeat(0..).discard()
     }
 
     fn space<'a>() -> Parser<'a, ()> {
-        one_of(" \t").repeat(1..).discard()
+        one_of(" \t\r\n").repeat(1..).discard()
     }
 
     fn positive<'a>() -> Parser<'a, i32> {
@@ -822,7 +823,8 @@ impl Vim {
 
 struct AudioSeed {
     time: std::sync::Arc<AtomicU32>,
-    play: std::sync::Arc<AtomicBool>
+    play: std::sync::Arc<AtomicBool>,
+    song: std::sync::Arc<AtomicOptionBox<Song>>
 }
 
 fn audio_write<T>(output: &mut [T], channels: usize, next_sample: &mut dyn FnMut() -> f32, audio_log: &mut AudioLog)
@@ -962,7 +964,8 @@ async fn main() -> io::Result<()> {
     let mut stdout = stdout.lock();
     let audio_time = std::sync::Arc::new(AtomicU32::new(0));
     let audio_play = std::sync::Arc::new(AtomicBool::new(cli.play));
-    let audio_seed = AudioSeed { time: audio_time.clone(), play: audio_play.clone() };
+    let audio_song = std::sync::Arc::new(AtomicOptionBox::<Song>::none());
+    let audio_seed = AudioSeed { time: audio_time.clone(), play: audio_play.clone(), song: audio_song.clone() };
     let audio = ami_boot_audio(audio_seed);
 
     enable_raw_mode()?;
@@ -1041,9 +1044,26 @@ async fn main() -> io::Result<()> {
                                 if dirty {
                                     // Completely parse buffer
                                     // TODO: Factor elsewhere
+                                    let mut line_starts:Vec<usize> = Default::default();
+                                    let mut all:String = Default::default();
+                                    // FIXME: Since I'm scanning twice, why not allocate an early buffer
+                                    for line in textarea.lines() {
+                                        line_starts.push(all.len());
+                                        all = all + line;
+                                    }
                                     let all = textarea.lines().join("\n");
                                     let song = parse_language(all);
-                                    //eprintln!("D: {:?}", song);
+                                    //eprintln!("D: {:?}", song.clone());
+                                    match song {
+                                        Ok(song) =>
+                                            // I *think* I don't need SeqCst because only one thread writes?
+                                            audio_song.store(Some(Box::new(song)), Ordering::AcqRel),
+                                        Err(error) => {
+                                            // TODO: Reverse Bad position
+                                            eprintln!("{}", error);
+                                        }
+                                    }
+
                                     dirty = false;
                                 }
                             },
