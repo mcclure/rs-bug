@@ -93,6 +93,7 @@ impl fmt::Display for Mode {
 }
 
 // How the Vim emulation state transitions
+#[derive(Clone)]
 enum Transition {
     Nop,
     Mode(Mode),
@@ -105,6 +106,57 @@ struct VimAudioSeed {
     time: std::sync::Arc<AtomicU32>,
     play: std::sync::Arc<AtomicBool>
 }
+
+// Language
+
+// Number: Play this note
+// Parenthesis: Store a pattern, first letter is the label (must be uppercase letter)
+// Square bracket: Scope
+// Uppercase letter: Play stored pattern
+// +Number, -Number: Shift base note by semitones
+// ++Number, --Number: Shift base note by octaves (or multiply/divide for non-notes)
+// x: rest
+// r: reset
+// pNumber, p+Number, p++Number etc: Set pitch, do NOT play note
+// tNumber, t+Number, t++Number etc: Set tempo (rate, high) // TODO
+// a&b: One, then the other
+
+type Song = Vec<i32>;
+
+fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
+    use pom::utf8::*;
+
+    fn opt_space<'a>() -> Parser<'a, ()> {
+        one_of(" \t").repeat(0..).discard()
+    }
+
+    fn space<'a>() -> Parser<'a, ()> {
+        one_of(" \t").repeat(1..).discard()
+    }
+
+    fn positive<'a>() -> Parser<'a, i32> {
+        let integer = (one_of("123456789").discard() * one_of("0123456789").discard().repeat(0..)).discard()
+            | sym('0').discard();
+//      let integer = digit.discard().repeat(1..);
+        integer.collect().convert(|x| x.parse::<i32>())
+    }
+
+//    let upper = one_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
+
+    // wqa! . Gets its own breakout cuz it's complicated
+    let parser =
+        opt_space() *
+        (positive() + (space() * positive()).repeat(0..)).map(|(val, vec)|{
+            let mut result = vec![val];
+            result.extend(vec);
+            result
+        }) - opt_space() - end()
+    ;
+    parser.parse_str(&input)
+}
+
+
+// Command line parser
 
 enum CommandLineTotality {
     Auto,
@@ -127,15 +179,16 @@ enum CommandLine {
 //    Split(Option<String>), // Filename
 }
 
+// TODO: ignore surrounding whitespace
 fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXME: &String?
     use pom::utf8::*;
 
     fn space<'a>() -> Parser<'a, ()> {
-        one_of(" \t").repeat(0..).discard()
+        one_of(" \t").repeat(1..).discard()
     }
 
     fn unspace<'a>() -> Parser<'a, ()> {
-        none_of(" \t").repeat(0..).discard()
+        none_of(" \t").repeat(1..).discard()
     }
 
     // wqa! . Gets its own breakout cuz it's complicated
@@ -153,7 +206,7 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
             + seq("!").opt().map(|x|x.is_some()) // Force?
         ).map(|(((a,b),c),d)| CommandLine::Wqae(a,b,c,d));
 
-    let parser =
+    let parser = (
         wqae
 
         | (seq("help") * space() * unspace().collect().map(|x| CommandLine::Help(x.to_string())))
@@ -168,7 +221,7 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
             ).map(|(s,t)|CommandLine::Set(s.to_string(), t))
 
         | (seq("beep").map(|_| CommandLine::Beep))
-    ;
+    ) - end();
     parser.parse_str(&input)
 }
 
@@ -176,14 +229,16 @@ fn parse_command_line(input:String) -> Result<CommandLine, pom::Error> { // FIXM
 struct Vim {
     mode: Mode,
     pending: Input, // Pending input to handle a sequence with two keys like gg
+    dirty: bool,
     audio:VimAudioSeed
 }
 
 impl Vim {
-    fn new(mode: Mode, audio:VimAudioSeed) -> Self {
+    fn new(mode: Mode, audio:VimAudioSeed, dirty:bool) -> Self {
         Self {
             mode,
             pending: Input::default(),
+            dirty,
             audio
         }
     }
@@ -196,6 +251,7 @@ impl Vim {
         Self {
             mode: self.mode,
             pending,
+            dirty: self.dirty,
             audio: self.audio
         }
     }
@@ -210,9 +266,10 @@ impl Vim {
         cursor_char < line_length
     }
 
-    fn transition(&self, input: Input, textarea: &mut TextArea<'_>, command: &mut TextArea<'_>) -> Transition {
+    // Result: Next state, dirtied this interaction?
+    fn transition(&self, input: Input, textarea: &mut TextArea<'_>, command: &mut TextArea<'_>) -> (Transition, bool) {
         if input.key == Key::Null {
-            return Transition::Nop;
+            return (Transition::Nop, false);
         }
 
         match self.mode {
@@ -287,6 +344,7 @@ impl Vim {
                     } => {
                         let mut cursor = textarea.cursor();
                         let mut line_count = 1;
+                        let mut dirty = false;
 
                         if let Some(((from_line, from_idx), (to_line, _))) = textarea.selection_range() {
                             // J with a selection joins all lines selected
@@ -303,19 +361,21 @@ impl Vim {
                             let success = textarea.delete_line_by_end();
                             if success { // A line existed
                                 textarea.insert_char(' ');
+                                dirty = true;
                             } else { // In regular vim, joining on the final line is a noop
                                 let (c1, c2) = cursor;
                                 textarea.move_cursor(CursorMove::Jump(c1 as u16, c2 as u16));
                                 self.beep();
                             }
                         }
+                        return (Transition::Nop, dirty);
                     }
                     Input {
                         key: Key::Char('D'),
                         ..
                     } => {
                         textarea.delete_line_by_end();
-                        return Transition::Mode(Mode::Normal);
+                        return (Transition::Mode(Mode::Normal), true);
                     }
                     Input {
                         key: Key::Char('C'),
@@ -323,14 +383,14 @@ impl Vim {
                     } => {
                         textarea.delete_line_by_end();
                         textarea.cancel_selection();
-                        return Transition::Mode(Mode::Insert);
+                        return (Transition::Mode(Mode::Insert), true);
                     }
                     Input {
                         key: Key::Char('p'),
                         ..
                     } => {
                         textarea.paste();
-                        return Transition::Mode(Mode::Normal);
+                        return (Transition::Mode(Mode::Normal), true);
                     }
                     Input {
                         key: Key::Char('u'),
@@ -338,7 +398,7 @@ impl Vim {
                         ..
                     } => {
                         textarea.undo();
-                        return Transition::Mode(Mode::Normal);
+                        return (Transition::Mode(Mode::Normal), true);
                     }
                     Input {
                         key: Key::Char('r'),
@@ -346,7 +406,7 @@ impl Vim {
                         ..
                     } => {
                         textarea.redo();
-                        return Transition::Mode(Mode::Normal);
+                        return (Transition::Mode(Mode::Normal), true);
                     }
                     Input {
                         key: Key::Char('x'),
@@ -357,14 +417,14 @@ impl Vim {
                         if Vim::is_before_line_end(&textarea) {
                             textarea.delete_next_char();
                         }
-                        return Transition::Mode(Mode::Normal);
+                        return (Transition::Mode(Mode::Normal), true);
                     }
                     Input {
                         key: Key::Char('i'),
                         ..
                     } => {
                         textarea.cancel_selection();
-                        return Transition::Mode(Mode::Insert);
+                        return (Transition::Mode(Mode::Insert), false);
                     }
                     Input {
                         key: Key::Char('a'),
@@ -375,7 +435,7 @@ impl Vim {
                         if Vim::is_before_line_end(&textarea) {
                             textarea.move_cursor(CursorMove::Forward);
                         }
-                        return Transition::Mode(Mode::Insert);
+                        return (Transition::Mode(Mode::Insert), false);
                     }
                     Input {
                         key: Key::Char('A'),
@@ -383,7 +443,7 @@ impl Vim {
                     } => {
                         textarea.cancel_selection();
                         textarea.move_cursor(CursorMove::End);
-                        return Transition::Mode(Mode::Insert);
+                        return (Transition::Mode(Mode::Insert), false);
                     }
                     Input {
                         key: Key::Char('S'),
@@ -418,7 +478,7 @@ impl Vim {
                             }
                         }
 
-                        return Transition::Mode(Mode::Insert);
+                        return (Transition::Mode(Mode::Insert), true);
                     }
                     Input {
                         key: Key::Char('o'),
@@ -426,7 +486,7 @@ impl Vim {
                     } => {
                         textarea.move_cursor(CursorMove::End);
                         textarea.insert_newline();
-                        return Transition::Mode(Mode::Insert);
+                        return (Transition::Mode(Mode::Insert), true);
                     }
                     Input {
                         key: Key::Char('O'),
@@ -435,7 +495,7 @@ impl Vim {
                         textarea.move_cursor(CursorMove::Head);
                         textarea.insert_newline();
                         textarea.move_cursor(CursorMove::Up);
-                        return Transition::Mode(Mode::Insert);
+                        return (Transition::Mode(Mode::Insert), true);
                     }
                     Input {
                         key: Key::Char('I'),
@@ -443,14 +503,14 @@ impl Vim {
                     } => {
                         textarea.cancel_selection();
                         textarea.move_cursor(CursorMove::Head);
-                        return Transition::Mode(Mode::Insert);
+                        return (Transition::Mode(Mode::Insert), false);
                     }
                     Input {
                         key: Key::Char('r'),
                         ..
                     } => {
                         // Notice selection is not cancelled-- it will be used by replace mode
-                        return Transition::Mode(Mode::Replace(true));
+                        return (Transition::Mode(Mode::Replace(true)), false);
                     }
                     Input {
                         key: Key::Char('R'),
@@ -460,7 +520,7 @@ impl Vim {
                             // R with a selection does the same thing as S-- it enters Insert NOT Replace mode.
                             return self.transition(Input { key: Key::Char('S'), ctrl: false, alt: false, shift: true }, textarea, command);
                         } else {
-                            return Transition::Mode(Mode::Replace(false));
+                            return (Transition::Mode(Mode::Replace(false)), false);
                         }
                     }
 
@@ -507,7 +567,7 @@ impl Vim {
                         ..
                     } if self.mode == Mode::Normal => {
                         textarea.start_selection();
-                        return Transition::Mode(Mode::Visual);
+                        return (Transition::Mode(Mode::Visual), false);
                     }
                     Input {
                         key: Key::Char('V'),
@@ -517,7 +577,7 @@ impl Vim {
                         textarea.move_cursor(CursorMove::Head);
                         textarea.start_selection();
                         textarea.move_cursor(CursorMove::End);
-                        return Transition::Mode(Mode::Visual);
+                        return (Transition::Mode(Mode::Visual), false);
                     }
                     Input { key: Key::Esc, .. }
                     | Input {
@@ -531,7 +591,7 @@ impl Vim {
                         ..
                     } if self.mode == Mode::Visual => {
                         textarea.cancel_selection();
-                        return Transition::Mode(Mode::Normal);
+                        return (Transition::Mode(Mode::Normal), false);
                     }
                     Input {
                         key: Key::Char('g'),
@@ -573,7 +633,7 @@ impl Vim {
                         ..
                     } if self.mode == Mode::Normal => {
                         textarea.start_selection();
-                        return Transition::Mode(Mode::Operator(op));
+                        return (Transition::Mode(Mode::Operator(op)), false);
                     }
                     Input {
                         key: Key::Char('y'),
@@ -582,7 +642,7 @@ impl Vim {
                     } if self.mode == Mode::Visual => {
                         textarea.move_cursor(CursorMove::Forward); // Vim's text selection is inclusive
                         textarea.copy();
-                        return Transition::Mode(Mode::Normal);
+                        return (Transition::Mode(Mode::Normal), false);
                     }
                     Input {
                         key: Key::Char('d'),
@@ -591,7 +651,7 @@ impl Vim {
                     } if self.mode == Mode::Visual => {
                         textarea.move_cursor(CursorMove::Forward); // Vim's text selection is inclusive
                         textarea.cut();
-                        return Transition::Mode(Mode::Normal);
+                        return (Transition::Mode(Mode::Normal), true);
                     }
                     Input {
                         key: Key::Char('c'),
@@ -600,7 +660,7 @@ impl Vim {
                     } if self.mode == Mode::Visual => {
                         textarea.move_cursor(CursorMove::Forward); // Vim's text selection is inclusive
                         textarea.cut();
-                        return Transition::Mode(Mode::Insert);
+                        return (Transition::Mode(Mode::Insert), true);
                     }
                     Input {
                         key: Key::Char(':'),
@@ -612,26 +672,26 @@ impl Vim {
                         command.move_cursor(CursorMove::Jump(0,0));
                         while command.delete_line_by_end() {} // Erase until it fails to erase
 
-                        return Transition::Mode(Mode::Command);
+                        return (Transition::Mode(Mode::Command), false);
                     }
-                    input => return Transition::Pending(input),
+                    input => return (Transition::Pending(input), false),
                 }
 
                 // Handle the pending operator
                 match self.mode {
                     Mode::Operator('y') => {
                         textarea.copy();
-                        Transition::Mode(Mode::Normal)
+                        (Transition::Mode(Mode::Normal), false)
                     }
                     Mode::Operator('d') => {
                         textarea.cut();
-                        Transition::Mode(Mode::Normal)
+                        (Transition::Mode(Mode::Normal), true)
                     }
                     Mode::Operator('c') => {
                         textarea.cut();
-                        Transition::Mode(Mode::Insert)
+                        (Transition::Mode(Mode::Insert), true)
                     }
-                    _ => Transition::Nop,
+                    _ => (Transition::Nop, false),
                 }
             }
             Mode::Insert => match input {
@@ -645,10 +705,10 @@ impl Vim {
                     key: Key::Char('c'),
                     ctrl: true,
                     ..
-                } => Transition::Mode(Mode::Normal),
+                } => (Transition::Mode(Mode::Normal), false),
                 input => {
                     textarea.input(input); // Use default key mappings in insert mode
-                    Transition::Mode(Mode::Insert)
+                    (Transition::Mode(Mode::Insert), true)
                 }
             },
             Mode::Replace(once) => match input {
@@ -663,13 +723,13 @@ impl Vim {
                     ctrl: true,
                     ..
                 } => {
-                    if textarea.selection_range().is_some() {
+                    (if textarea.selection_range().is_some() {
                         // The user made a selection, hit lowercase 'r', then aborted.
                         // (It shouldn't be possible to get here in non-"once" mode.)
                         Transition::Mode(Mode::Visual)
                     } else {
                         Transition::Mode(Mode::Normal)
-                    }
+                    }, false)
                 },
                 Input { key, .. }  => {
                     if match key { Key::Down | Key::Up | Key::Left | Key::Right => false, _ => true }
@@ -704,14 +764,16 @@ impl Vim {
                             }
                             textarea.input(input); // Use default key mappings in insert mode
                         }
+                        true
                     } else {
                         self.beep();
-                    }
-                    if once {
+                        false
+                    };
+                    (if once {
                         Transition::Mode(Mode::Normal)   
                     } else {
                         Transition::Mode(Mode::Replace(false))
-                    }
+                    }, false)
                 }
             },
             Mode::Command => match input {
@@ -721,13 +783,13 @@ impl Vim {
                     key: Key::Char('c'),
                     ctrl: true,
                     ..
-                } => Transition::Mode(Mode::Normal),
+                } => (Transition::Mode(Mode::Normal), false),
                 // Investigate history
                 // TODO scroll history
                 Input { key: Key::Up, .. }
                 | Input { key: Key::Down, .. } => {
                     self.beep();
-                    Transition::Mode(Mode::Command)
+                    (Transition::Mode(Mode::Command), false)
                 },
                 // Enter command successfully
                 Input { key: Key::Enter, .. } => {
@@ -738,7 +800,7 @@ impl Vim {
                     match entry { // Notice: Currently w not supported
                         Ok(CommandLine::Wqae(false, q, _totality, _exclamation)) => {
                             if q {
-                                return Transition::Quit; // Short circuit?
+                                return (Transition::Quit, false); // Short circuit
                             }
                         },
                         _ => {
@@ -746,12 +808,12 @@ impl Vim {
                         }
                     }
 
-                    Transition::Mode(Mode::Normal)
+                    (Transition::Mode(Mode::Normal), false)
                 },
                 // Type into command buffer
                 _ => {
                     command.input(input);
-                    Transition::Mode(Mode::Command)
+                    (Transition::Mode(Mode::Command), false)
                 }
             },
         }
@@ -926,7 +988,7 @@ async fn main() -> io::Result<()> {
     command.set_block(Block::default().borders(Borders::NONE));
     command.set_cursor_style(Style::default().fg(Color::Reset).add_modifier(Modifier::REVERSED));
 
-    let mut vim = Vim::new(Mode::Normal, VimAudioSeed { time:audio_time, play:audio_play.clone() }); // Note: time NOT cloned
+    let mut vim = Vim::new(Mode::Normal, VimAudioSeed { time:audio_time, play:audio_play.clone() }, false); // Note: time NOT cloned
 
     const FRAMES_PER_SECOND:f32 = 60.0;
     let period = std::time::Duration::from_secs_f32(1.0 / FRAMES_PER_SECOND);
@@ -969,12 +1031,42 @@ async fn main() -> io::Result<()> {
                         audio_play.fetch_xor(true, Ordering::Relaxed);
                     },
                     _ => { // Mode match
-                        vim = match vim.transition(event.into(), &mut textarea, &mut command) {
+                        let transition; let mut dirty;
+                        (transition, dirty) = vim.transition(event.into(), &mut textarea, &mut command);
+                        dirty = dirty || vim.dirty;
+
+                        match (transition.clone(), vim.mode) {
+                            (Transition::Nop, Mode::Normal) |
+                            (Transition::Mode(Mode::Normal), _) => {
+                                if dirty {
+                                    // Completely parse buffer
+                                    // TODO: Factor elsewhere
+                                    let all = textarea.lines().join("\n");
+                                    let song = parse_language(all);
+                                    //eprintln!("D: {:?}", song);
+                                    dirty = false;
+                                }
+                            },
+                            _ => ()
+                        };
+
+                        vim = match transition {
+                            // Audio or UI changed
                             Transition::Mode(mode) if vim.mode != mode => {
                                 textarea.set_block(mode.block());
                                 textarea.set_cursor_style(mode.cursor_style());
-                                Vim::new(mode, vim.audio)
+                                Vim::new(mode, vim.audio, dirty)
                             }
+
+                            // Only audio changed
+                            Transition::Mode(mode) if vim.dirty != dirty => {
+                                Vim::new(mode, vim.audio, dirty)
+                            }
+                            Transition::Nop if vim.dirty != dirty => {
+                                Vim::new(vim.mode, vim.audio, dirty)
+                            }
+
+                            // Nothing changed
                             Transition::Nop | Transition::Mode(_) => vim,
                             Transition::Pending(input) => vim.with_pending(input),
                             Transition::Quit => { should_quit = true; vim },
