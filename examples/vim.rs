@@ -458,7 +458,7 @@ impl Vim {
                     } => {
                         if textarea.selection_range().is_some() {
                             // R with a selection does the same thing as S-- it enters Insert NOT Replace mode.
-                            return self.transition(Input { key: Key::Char('S'), ctrl: false, alt: false, shift: true }, textarea);
+                            return self.transition(Input { key: Key::Char('S'), ctrl: false, alt: false, shift: true }, textarea, command);
                         } else {
                             return Transition::Mode(Mode::Replace(false));
                         }
