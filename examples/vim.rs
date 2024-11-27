@@ -306,7 +306,7 @@ impl Vim {
                             } else { // In regular vim, joining on the final line is a noop
                                 let (c1, c2) = cursor;
                                 textarea.move_cursor(CursorMove::Jump(c1 as u16, c2 as u16));
-                                // TODO: beep
+                                self.beep();
                             }
                         }
                     }
@@ -704,7 +704,9 @@ impl Vim {
                             }
                             textarea.input(input); // Use default key mappings in insert mode
                         }
-                    } // TODO: else beep
+                    } else {
+                        self.beep();
+                    }
                     if once {
                         Transition::Mode(Mode::Normal)   
                     } else {
@@ -721,7 +723,7 @@ impl Vim {
                     ..
                 } => Transition::Mode(Mode::Normal),
                 // Investigate history
-                // TODO either scroll history or at least beep
+                // TODO scroll history
                 Input { key: Key::Up, .. }
                 | Input { key: Key::Down, .. } => {
                     self.beep();
