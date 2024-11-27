@@ -733,48 +733,49 @@ impl Vim {
                     }, false)
                 },
                 Input { key, .. }  => {
-                    if match key { Key::Down | Key::Up | Key::Left | Key::Right => false, _ => true }
-                    && !(once && (key == Key::Backspace || key == Key::Delete)) { // Allowed with R, not r
-                        if let Some(((from_line, from_idx), (to_line, to_idx))) = textarea.selection_range() {
-                            // Bizarro 'r' with a selection: Replace every non-newline character at once?!
-                            let mut next_start_idx = from_idx;
-                            for line_idx in from_line..=to_line {
-                                let lines = textarea.lines();
-                                let line = &lines[line_idx];
-                                let line_len = line.len();
+                    let dirty =
+                        if match key { Key::Down | Key::Up | Key::Left | Key::Right => false, _ => true }
+                        && !(once && (key == Key::Backspace || key == Key::Delete)) { // Allowed with R, not r
+                            if let Some(((from_line, from_idx), (to_line, to_idx))) = textarea.selection_range() {
+                                // Bizarro 'r' with a selection: Replace every non-newline character at once?!
+                                let mut next_start_idx = from_idx;
+                                for line_idx in from_line..=to_line {
+                                    let lines = textarea.lines();
+                                    let line = &lines[line_idx];
+                                    let line_len = line.len();
 
-                                textarea.move_cursor(CursorMove::Jump(line_idx as u16, next_start_idx as u16));
+                                    textarea.move_cursor(CursorMove::Jump(line_idx as u16, next_start_idx as u16));
 
-                                // "min" is to handle the odd case where the cursor is on the newline (not possible in real vim)
-                                let end_idx = if line_idx==to_line { line_len.min(to_idx+1) }
-                                else { line_len };
+                                    // "min" is to handle the odd case where the cursor is on the newline (not possible in real vim)
+                                    let end_idx = if line_idx==to_line { line_len.min(to_idx+1) }
+                                    else { line_len };
 
-                                for _ in next_start_idx..end_idx {
-                                    textarea.delete_next_char();
-                                    textarea.input(input.clone());
+                                    for _ in next_start_idx..end_idx {
+                                        textarea.delete_next_char();
+                                        textarea.input(input.clone());
+                                    }
+
+                                    next_start_idx = 0;
                                 }
 
-                                next_start_idx = 0;
+                                textarea.move_cursor(CursorMove::Jump(from_line as u16, from_idx as u16));
+                            } else {
+                                // Normal 'r'
+                                if Vim::is_before_line_end(&textarea) {
+                                    textarea.delete_next_char(); // FIXME: Will eat newlines and join into next line, should act like insert at end of line
+                                }
+                                textarea.input(input); // Use default key mappings in insert mode
                             }
-
-                            textarea.move_cursor(CursorMove::Jump(from_line as u16, from_idx as u16));
+                            true
                         } else {
-                            // Normal 'r'
-                            if Vim::is_before_line_end(&textarea) {
-                                textarea.delete_next_char(); // FIXME: Will eat newlines and join into next line, should act like insert at end of line
-                            }
-                            textarea.input(input); // Use default key mappings in insert mode
-                        }
-                        true
-                    } else {
-                        self.beep();
-                        false
-                    };
+                            self.beep();
+                            false
+                        };
                     (if once {
                         Transition::Mode(Mode::Normal)   
                     } else {
                         Transition::Mode(Mode::Replace(false))
-                    }, false)
+                    }, dirty)
                 }
             },
             Mode::Command => match input {
@@ -864,19 +865,34 @@ where
     let audio_playing = audio_additional.play.clone();
     let audio_song = audio_additional.song.clone();
 
-    let spq = (60.0*48000.0/(BPM as f64)/4.0).floor() as i32;
+    let mut song:Song = vec![];
 
-    let square_periods:Vec<_> = vec![110, 220, 440].into_iter().map(|x|48000/x).collect();
+    let spq = (60.0*48000.0/(BPM as f64)/4.0).floor() as i32;
 
     let mut next_value = move || {
         counter += 1;
         beat_counter += 1;
+
+        if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
+            song = *new_song;
+        }
+
         if beat_counter > spq {
             beat_idx += 1;
             beat_counter = 0;
         }
+        if beat_idx >= song.len() {
+            beat_idx = 0;
+        }
 
-        if counter > square_periods[beat_idx % square_periods.len()] {
+        let period = if beat_idx < song.len() {
+            let pitch_index = song[beat_idx];
+            220 >> pitch_index
+        } else {
+            0x7FFFFFFF
+        };
+
+        if counter > period {
             high = !high;
             counter = 0;
         }
