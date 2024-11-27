@@ -867,6 +867,26 @@ where
 
     let mut song:Song = vec![];
 
+    let notes = {
+        let mut notes:Vec<i32> = Default::default();
+        let mut base_freq = 440.0 / 32.0;
+        let semitone = (2.0_f64).powf(1.0/12.0);
+        for _ in 0..=8 { // I REFUSE to play notes below MIDI 8. I just DON'T WANT TO BOTHER.
+            notes.push(0x7FFFFFFF);
+        }
+        for _x in 0..=9 { // Nine octaves above that. Whatever
+            let mut freq = base_freq;
+            for _y in 0..12 {
+                let period = (48000.0_f64/freq/2.0).floor() as i32; // div two because half cycles
+                eprintln!("{}: {freq} = {period}", notes.len());
+                notes.push(period);
+                freq *= semitone;
+            }
+            base_freq *= 2.0;
+        }
+        notes
+    };
+
     let spq = (60.0*48000.0/(BPM as f64)/4.0).floor() as i32;
 
     let mut next_value = move || {
@@ -875,6 +895,9 @@ where
 
         if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
             song = *new_song;
+            if song.len() == 0 {
+                song.push(0);
+            }
         }
 
         if beat_counter > spq {
@@ -885,12 +908,8 @@ where
             beat_idx = 0;
         }
 
-        let period = if beat_idx < song.len() {
-            let pitch_index = song[beat_idx];
-            220 >> pitch_index
-        } else {
-            0x7FFFFFFF
-        };
+        let pitch_index = song[beat_idx];
+        let period = notes[pitch_index as usize];
 
         if counter > period {
             high = !high;
