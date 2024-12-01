@@ -136,7 +136,7 @@ enum Act {
 }
 
 enum Adjust {
-    Pitch(Act), // PT
+    Pitch(Act, bool), // PT // Argument 2 is for "hard/send", e.g., p+ vs p++
     Tempo(Act),
     Duty(Act),
     Reset // FIXME: Consider partials?
@@ -150,7 +150,7 @@ enum Pitch {
     Rest      // PT
 }
 
-type Note = (Option<Vec<Adjust>>, Pitch);
+type Note = (Vec<Adjust>, Pitch); // No adjustments -> vec len 0
 
 enum Node {
     Play(Note),
@@ -163,34 +163,65 @@ struct Song {
     score: Vec<Node>
 }
 
+// - TODO: Do the "name" args serve a purpose? Do they create perf issues? Should they be commented out?
 fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     use pom::utf8::*;
 
     fn opt_space<'a>() -> Parser<'a, ()> {
         one_of(" \t\r\n").repeat(0..).discard()
+            .name("opt_space")
     }
 
     fn space<'a>() -> Parser<'a, ()> {
         one_of(" \t\r\n").repeat(1..).discard()
+            .name("space")
     }
 
     fn positive<'a>() -> Parser<'a, i32> {
-        let integer = (sym('-').discard().opt() * one_of("123456789").discard() * one_of("0123456789").discard().repeat(0..)).discard()
+        let integer = (one_of("123456789").discard() * one_of("0123456789").discard().repeat(0..)).discard()
             | sym('0').discard();
+//      sym('-').discard().opt() * // TODO: negative numbers via quotes
 //      let integer = digit.discard().repeat(1..);
         integer.collect().convert(|x| x.parse::<i32>())
+            .name("positive")
+    }
+
+    fn act<'a>() -> Parser<'a, Act> {
+        (
+            (sym('v') * positive()).map(|x| Act::Versus(x))
+            | (seq("++") * positive()).map(|x| Act::Double(x))
+            | (seq("--") * positive()).map(|x| Act::Double(-x))
+            | (sym('+') * positive()).map(|x| Act::Increment(x))
+            | (sym('-') * positive()).map(|x| Act::Increment(-x))
+            //| (sym('=') * positive()).map(|x| Act::Set(x)) // Maybe?
+        ).name("act")
+    }
+
+    fn adjust<'a>() -> Parser<'a, Adjust> {
+        (
+            sym('r').map(|_|Adjust::Reset)
+            | (sym('d') * act()).map(|act|Adjust::Duty(act))
+            | (sym('t') * act()).map(|act|Adjust::Tempo(act))
+            | (sym('p') * positive()).map(|x|Adjust::Pitch(Act::Set(x), true))
+            | (sym('p').opt() + act()).map(|(hard, act)|Adjust::Pitch(act, hard.is_some()))
+        ).name("adjust")
     }
 
     fn note_pitch<'a>() -> Parser<'a, Pitch> {
-        sym('x').map(|_|Pitch::Rest) | positive().map(Pitch::Rel)
+        (
+            sym('x').map(|_|Pitch::Rest) | positive().map(Pitch::Rel)
+        ).name("pitch")
     }
 
-    fn note<'a>() -> Parser<'a, Note> {
-        note_pitch().map(|x|(None, x))
+    fn note<'a>() -> Parser<'a, Note> { // TODO: Collapse Option<Vec<Adjust>> into Vec<Adjust> and use 0..?
+        (
+            (adjust() - space()).repeat(0..) + note_pitch()
+        ).name("note")
     }
 
     fn node<'a>() -> Parser<'a, Node> {
         note().map(Node::Play)
+            .name("node")
     }
 
 //    let upper = one_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
@@ -938,7 +969,7 @@ where
     let audio_song = audio_additional.song.clone();
 
     let mut song:Song = Default::default();
-    const REST_NODE:Node = Node::Play((None, Pitch::Abs(0)));
+    const REST_NODE:Node = Node::Play((vec![], Pitch::Abs(0)));
     song.score.push(REST_NODE); // No empty
 
     let SQUARE_RADIX:i32 = 32; // Fixed point for better accuracy
@@ -986,8 +1017,8 @@ where
             beat_idx = 0;
         }
 
-        let pitch_index = match song.score[beat_idx] {
-            Node::Play((None, Pitch::Abs(x))) => x,
+        let pitch_index = match &song.score[beat_idx] {
+            Node::Play((v, Pitch::Abs(x))) if v.len()==0 => *x,
             _ => unreachable!()
         };
         let period = notes[pitch_index as usize];

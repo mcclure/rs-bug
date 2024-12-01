@@ -110,7 +110,7 @@ serde_json = "1.0.120"
 
 # vim demo special
 # note: so is ratatui features=["event-stream"]
-pom = "*"
+pom = { version = "*", features = [] } # "trace"
 cpal = "*"
 tokio = {version = "*", features = ["rt", "macros", "time", "rt-multi-thread"]}
 futures = "0.3.30"
