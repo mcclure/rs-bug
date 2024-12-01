@@ -119,10 +119,49 @@ struct VimAudioSeed {
 // x: rest
 // r: reset
 // pNumber, p+Number, p++Number etc: Set pitch, do NOT play note
-// tNumber, t+Number, t++Number etc: Set tempo (rate, high) // TODO
+// tNumber, t+Number, t++Number etc: Set tempo (rate, high)
+// dNumber, d+Number, d++Number etc: set duty/duration (against basis of 8)
 // a&b: One, then the other
 
-type Song = Vec<i32>;
+// TODOs/consider: pv, dv; &&, &&&; !!, !; :;
+
+// In comments below: An //AT comment implies audio thread only, a //PT comment implies processing thread only
+// There are two forms of this AST, a "raw" form and a "clean" form, but they have the same type.
+
+enum Act {
+    Set(i32),
+    Increment(i32),
+    Double(i32),
+    Versus(i32)
+}
+
+enum Adjust {
+    Pitch(Act), // PT
+    Tempo(Act),
+    Duty(Act),
+    Reset // FIXME: Consider partials?
+}
+
+// The "primary value" of a note. May or may not literally correspond to pitch.
+// I tried really hard to think of a name for this enum other than "pitch" and failed.
+enum Pitch {
+    Abs(i32), // AT (0 == rest); MUST be sanitized for 0-128 range by time reaches AT
+    Rel(i32), // PT
+    Rest      // PT
+}
+
+type Note = (Option<Vec<Adjust>>, Pitch);
+
+enum Node {
+    Play(Note),
+    Fork(Vec<Node>)
+}
+
+#[derive(Default)]
+struct Song {
+    prefix: Vec<Adjust>, // TODO consider tinyvec
+    score: Vec<Node>
+}
 
 fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     use pom::utf8::*;
@@ -139,31 +178,56 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
         let integer = (sym('-').discard().opt() * one_of("123456789").discard() * one_of("0123456789").discard().repeat(0..)).discard()
             | sym('0').discard();
 //      let integer = digit.discard().repeat(1..);
-        integer.collect().convert(|x| x.parse::<i32>().map(
-            |x| x + 69 - 12 // TODO: Remove -12 when it's easier to shift octave
-        ).map(
-            |x| if x >= 0 && x < 128 { x } else { 0 } // Rest on illegal notes
-        ) )
+        integer.collect().convert(|x| x.parse::<i32>())
     }
 
-    fn note<'a>() -> Parser<'a, i32> {
-        sym('x').map(|_|0) | positive()
+    fn note_pitch<'a>() -> Parser<'a, Pitch> {
+        sym('x').map(|_|Pitch::Rest) | positive().map(Pitch::Rel)
+    }
+
+    fn note<'a>() -> Parser<'a, Note> {
+        note_pitch().map(|x|(None, x))
+    }
+
+    fn node<'a>() -> Parser<'a, Node> {
+        note().map(Node::Play)
     }
 
 //    let upper = one_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
 
-    // wqa! . Gets its own breakout cuz it's complicated
+    // TODO: parser should produce a song
     let parser =
         opt_space() *
-        (note() + (space() * note()).repeat(0..)).map(|(val, vec)|{
+        (node() + (space() * node()).repeat(0..)).map(|(val, vec)|{
             let mut result = vec![val];
             result.extend(vec);
             result
         }) - opt_space() - end()
     ;
-    parser.parse_str(&input)
+    parser.map(|score|Song {prefix: vec!(), score}).parse_str(&input)
 }
 
+// Translate PT to AT
+fn absolute_language(s:Song) -> Song {
+    fn fit_range(x:i32) -> i32 {
+        x.clamp(0,127)
+    }
+    fn absolute_node(node:Node) -> Node {
+        match node {
+            Node::Play((adjust, pitch)) => {
+                Node::Play((adjust, match pitch {
+                    Pitch::Rest => Pitch::Abs(0),
+                    Pitch::Rel(x) => Pitch::Abs(fit_range(x + 69 - 12)), // TODO: Remove -12 when it's easier to shift octave
+                    Pitch::Abs(x) => Pitch::Abs(fit_range(x))
+                }))
+            },
+            Node::Fork(all) => Node::Fork(all.into_iter().map(absolute_node).collect())
+        }
+    }
+
+    // Todo: Surf prefix for note offsets
+    Song{prefix:s.prefix, score:s.score.into_iter().map(absolute_node).collect()}
+}
 
 // Command line parser
 
@@ -873,7 +937,9 @@ where
     let audio_playing = audio_additional.play.clone();
     let audio_song = audio_additional.song.clone();
 
-    let mut song:Song = vec![0];
+    let mut song:Song = Default::default();
+    const REST_NODE:Node = Node::Play((None, Pitch::Abs(0)));
+    song.score.push(REST_NODE); // No empty
 
     let SQUARE_RADIX:i32 = 32; // Fixed point for better accuracy
 
@@ -907,8 +973,8 @@ where
 
         if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
             song = *new_song;
-            if song.len() == 0 {
-                song.push(0);
+            if song.score.len() == 0 {
+                song.score.push(REST_NODE);
             }
         }
 
@@ -916,11 +982,14 @@ where
             beat_idx += 1;
             beat_counter = 0;
         }
-        if beat_idx >= song.len() {
+        if beat_idx >= song.score.len() {
             beat_idx = 0;
         }
 
-        let pitch_index = song[beat_idx];
+        let pitch_index = match song.score[beat_idx] {
+            Node::Play((None, Pitch::Abs(x))) => x,
+            _ => unreachable!()
+        };
         let period = notes[pitch_index as usize];
 
         if counter > period {
@@ -1114,9 +1183,11 @@ async fn main() -> io::Result<()> {
                                         else { Ok(Default::default()) }; // Empty string is valid
                                     //eprintln!("D: {:?}", song.clone());
                                     match song {
-                                        Ok(song) =>
+                                        Ok(song) => {
                                             // I *think* I don't need SeqCst because only one thread writes?
-                                            audio_song.store(Some(Box::new(song)), Ordering::AcqRel),
+                                            let song = absolute_language(song);
+                                            audio_song.store(Some(Box::new(song)), Ordering::AcqRel)
+                                        },
                                         Err(error) => {
                                             // TODO: Reverse Bad position
                                             eprintln!("{}", error);
