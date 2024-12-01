@@ -219,9 +219,21 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
         ).name("note")
     }
 
+    // Utility
+    fn tuple_merge<T>(t:(T, Vec<T>)) -> Vec<T> {
+        let (val, vec) = t;
+        let mut result = vec![val];
+        result.extend(vec);
+        result
+    }
+
     fn node<'a>() -> Parser<'a, Node> {
-        note().map(Node::Play)
-            .name("node")
+        (
+            (
+                note().map(Node::Play) + (opt_space() * sym('&') * opt_space() * note().map(Node::Play)).repeat(1..)
+            ).map(tuple_merge).map(Node::Fork)
+            | note().map(Node::Play)
+        ).name("node")
     }
 
 //    let upper = one_of("ABCDEFGHIJKLMNOPQRSTUVWXYZ");
@@ -229,11 +241,7 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
     // TODO: parser should produce a song
     let parser =
         opt_space() *
-        (node() + (space() * node()).repeat(0..)).map(|(val, vec)|{
-            let mut result = vec![val];
-            result.extend(vec);
-            result
-        }) - opt_space() - end()
+        (node() + (space() * node()).repeat(0..)).map(tuple_merge) - opt_space() - end()
     ;
     parser.map(|score|Song {prefix: vec!(), score}).parse_str(&input)
 }
