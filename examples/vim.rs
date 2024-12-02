@@ -293,6 +293,7 @@ enum CommandLineSetType {
     Question
 }
 
+// TODO: reset, reset!, set for tones, play
 enum CommandLine {
     Wqae(bool, bool, CommandLineTotality, bool), // Write, Quit, All/Buffer, Exclamation
     Help(String),
@@ -970,28 +971,59 @@ where
     }
 }
 
-const BPM:i32 = 110;
-
 fn audio_run<T>(device: &cpal::Device, config: &cpal::StreamConfig, audio_additional:AudioSeed) -> Result<cpal::Stream, CpalError>
 where
     T: SizedSample + FromSample<f32> + bytemuck::Pod, /* Pod constraint can be removed without audio_log */
 {
+//    struct Frame {
+//
+//    }
+    #[derive(Debug, Clone)]
+    struct AdjustState {
+        root:i32,        // Base note ('notes' index)
+        pitch:i32,       // Pitch (index relative to base note)
+        rate:i32,        // Note length (samples)
+//        duty:i32,        // For what portion of the note is it "held"? (subsamples)
+//        duty_vs:i32,     // Radix of duty (scalar)
+//        duty_subsample_cache:i32
+    }
+    #[derive(Debug, Clone)]
+    struct PlayState {
+        // TODO Separate? Traits?
+        synth_at:i32,       // Progress within square cycle (subsamples)
+        synth_high:bool,    // Is square high?
+
+        sample_at:i32,      // Progress within beat (samples)
+        beat_at:usize,        // Beat ('song.score' index)
+    }
+    #[derive(Debug, Clone)]
+    struct State { // TODO rename "frame"?
+        // TODO: CoreState with pitch_vs, rate_vs?
+        adjust:AdjustState,
+        play:PlayState
+    }
+
+    const BPM:i32 = 110;
+    const SQUARE_RADIX:i32 = 32; // "Subsample" fixed point for better pitch accuracy
+    const REST_NODE:Node = Node::Play((vec![], Pitch::Abs(0)));
+    const DEFAULT_ADJUST:AdjustState = AdjustState {
+        root:69-12, pitch:0, rate:(60.0*48000.0/(BPM as f64)/4.0) as i32,
+        //duty:8, duty_vs:8
+    };
+    const DEFAULT_PLAY:PlayState = PlayState {
+        synth_at: 0, synth_high:false, sample_at:0, beat_at:0
+    };
+
 //    let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
-    let mut counter = 0;
-    let mut beat_counter = 0;
-    let mut beat_idx = 0;
-    let mut high = false;
+    let mut state = State {adjust: DEFAULT_ADJUST, play: DEFAULT_PLAY};
 
     let audio_time = audio_additional.time.clone();
     let audio_playing = audio_additional.play.clone();
     let audio_song = audio_additional.song.clone();
 
     let mut song:Song = Default::default();
-    const REST_NODE:Node = Node::Play((vec![], Pitch::Abs(0)));
     song.score.push(REST_NODE); // No empty
-
-    let SQUARE_RADIX:i32 = 32; // Fixed point for better accuracy
 
     // FIXME: These are slightly detuned from the A440 I find on youtube
     let notes = {
@@ -1015,11 +1047,9 @@ where
         notes
     };
 
-    let spq = (60.0*48000.0/(BPM as f64)/4.0).floor() as i32;
-
     let mut next_value = move || {
-        counter += SQUARE_RADIX;
-        beat_counter += 1;
+        state.play.synth_at += SQUARE_RADIX;
+        state.play.sample_at += 1;
 
         if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
             song = *new_song;
@@ -1028,28 +1058,28 @@ where
             }
         }
 
-        if beat_counter > spq {
-            beat_idx += 1;
-            beat_counter = 0;
+        if state.play.sample_at > state.adjust.rate {
+            state.play.beat_at += 1;
+            state.play.sample_at = 0;
         }
-        if beat_idx >= song.score.len() {
-            beat_idx = 0;
+        if state.play.beat_at >= song.score.len() {
+            state.play.beat_at = 0;
         }
 
-        let pitch_index = match &song.score[beat_idx] {
+        let pitch_index = match &song.score[state.play.beat_at] {
             Node::Play((v, Pitch::Abs(x))) if v.len()==0 => *x,
             _ => unreachable!()
         };
         let period = notes[pitch_index as usize];
 
-        if counter > period {
-            high = !high;
-            counter -= period;
+        if state.play.synth_at > period {
+            state.play.synth_high = !state.play.synth_high;
+            state.play.synth_at -= period;
         }
 
-        audio_time.store(beat_idx as u32, Ordering::Relaxed);
+        audio_time.store(state.play.beat_at as u32, Ordering::Relaxed);
 
-        if high {
+        if state.play.synth_high {
             0.25
         } else {
             0.0
