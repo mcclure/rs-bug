@@ -1015,13 +1015,62 @@ where
     const DEFAULT_PLAY:PlayState = PlayState {
         synth_at: 0, synth_high:false, sample_at:0, beat_at:0
     };
+
     fn fit_range(x:i32) -> i32 {
         x.clamp(0,127)
+    }
+
+    fn do_adjust(v:&Vec<Adjust>, state:&mut AdjustState, default:&AdjustState) {
+        for adjust in v {
+            match adjust {
+                Adjust::Pitch(act, _) => match act {
+                    Act::Set(x) => state.root = *x,
+                    Act::Increment(x) =>  state.root += *x,
+                    Act::Double(x) => state.root += *x * 12,
+                    Act::Versus(_) => todo!(),
+                },
+                Adjust::Tempo(act) => {
+                    match act {
+                        Act::Set(x) => state.rate = *x,
+                        Act::Increment(_) => todo!(),
+                        Act::Double(x) => if *x > 0 {
+                                state.rate *= *x;
+                            } else {
+                                state.rate /= -*x;
+                            },
+                        Act::Versus(_) => todo!(),
+                    }
+                    state.duty_as_sample_cache = state.duty * state.rate / state.duty_vs;
+                },
+                Adjust::Duty(act) => {
+                    match act {
+                        Act::Set(x) => state.duty = *x,
+                        Act::Increment(x) => state.duty += *x,
+                        Act::Double(x) => if *x > 0 {
+                            state.rate *= *x;
+                        } else {
+                            state.rate /= -*x;
+                        },
+                        Act::Versus(x) => {
+                            // Kludge?: Rescale duty to duty_vs
+                            state.duty *= state.duty_vs;
+                            state.duty_vs = *x;
+                            state.duty /= state.duty_vs;
+                            state.duty = state.duty.max(1);
+                        },
+                    }
+                    state.duty = state.duty.min(state.duty_vs);
+                    state.duty_as_sample_cache = state.duty * state.rate / state.duty_vs;
+                },
+                Adjust::Reset => *state = default.clone(),
+            }
+        }
     }
 
 // FIXME: sample_rate is really pretty important. Currently 44100 is assumed.
 //    let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
+    let mut reset_adjust = DEFAULT_ADJUST;
     let mut state = State {adjust: DEFAULT_ADJUST, play: DEFAULT_PLAY};
 
     // Copy cross thread values into closure
@@ -1065,6 +1114,10 @@ where
         if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
             song = *new_song;
             //eprintln!("{:#?}", song.clone());
+
+            reset_adjust = DEFAULT_ADJUST;
+            do_adjust(&song.prefix, &mut reset_adjust, &DEFAULT_ADJUST);
+
             if song.score.len() == 0 {
                 song.score.push(REST_NODE);
             }
@@ -1089,7 +1142,8 @@ where
         if state.play.beat_at >= song.score.len() {
             state.play.beat_at = 0;
 
-            state.adjust = DEFAULT_ADJUST; // Implicit reset each loop. Consider making customizable?
+            // FIXME: File a bug on what happens with this next line if you remove clone()
+            state.adjust = reset_adjust; // Implicit reset each loop. Consider making customizable?
             need_adjustment = true;
         }
 
@@ -1101,50 +1155,7 @@ where
         if need_adjustment {
             match &song.score[state.play.beat_at] {
                 Node::Play((v, _)) => {
-                    for adjust in v {
-                        match adjust {
-                            Adjust::Pitch(act, _) => match act {
-                                Act::Set(x) => state.adjust.root = *x,
-                                Act::Increment(x) =>  state.adjust.root += *x,
-                                Act::Double(x) => state.adjust.root += *x * 12,
-                                Act::Versus(_) => todo!(),
-                            },
-                            Adjust::Tempo(act) => {
-                                match act {
-                                    Act::Set(x) => state.adjust.rate = *x,
-                                    Act::Increment(_) => todo!(),
-                                    Act::Double(x) => if *x > 0 {
-                                            state.adjust.rate *= *x;
-                                        } else {
-                                            state.adjust.rate /= -*x;
-                                        },
-                                    Act::Versus(_) => todo!(),
-                                }
-                                state.adjust.duty_as_sample_cache = state.adjust.duty * state.adjust.rate / state.adjust.duty_vs;
-                            },
-                            Adjust::Duty(act) => {
-                                match act {
-                                    Act::Set(x) => state.adjust.duty = *x,
-                                    Act::Increment(x) => state.adjust.duty += *x,
-                                    Act::Double(x) => if *x > 0 {
-                                        state.adjust.rate *= *x;
-                                    } else {
-                                        state.adjust.rate /= -*x;
-                                    },
-                                    Act::Versus(x) => {
-                                        // Kludge?: Rescale duty to duty_vs
-                                        state.adjust.duty *= state.adjust.duty_vs;
-                                        state.adjust.duty_vs = *x;
-                                        state.adjust.duty /= state.adjust.duty_vs;
-                                        state.adjust.duty = state.adjust.duty.max(1);
-                                    },
-                                }
-                                state.adjust.duty = state.adjust.duty.min(state.adjust.duty_vs);
-                                state.adjust.duty_as_sample_cache = state.adjust.duty * state.adjust.rate / state.adjust.duty_vs;
-                            },
-                            Adjust::Reset => state.adjust = DEFAULT_ADJUST,
-                        }
-                    }
+                    do_adjust(v, &mut state.adjust, &reset_adjust);
                 },
                 _ => unreachable!()
             }
