@@ -129,6 +129,7 @@ struct VimAudioSeed {
 // In comments below: An //AT comment implies audio thread only, a //PT comment implies processing thread only
 // There are two forms of this AST, a "raw" form and a "clean" form, but they have the same type.
 
+#[derive(Debug, Clone)]
 enum Act {
     Set(i32),
     Increment(i32),
@@ -136,6 +137,7 @@ enum Act {
     Versus(i32)
 }
 
+#[derive(Debug, Clone)]
 enum Adjust {
     Pitch(Act, bool), // PT // Argument 2 is for "hard/send", e.g., p+ vs p++
     Tempo(Act),
@@ -145,6 +147,7 @@ enum Adjust {
 
 // The "primary value" of a note. May or may not literally correspond to pitch.
 // I tried really hard to think of a name for this enum other than "pitch" and failed.
+#[derive(Debug, Clone)]
 enum Pitch {
     Abs(i32), // AT (0 == rest); MUST be sanitized for 0-128 range by time reaches AT
     Rel(i32), // PT
@@ -153,12 +156,13 @@ enum Pitch {
 
 type Note = (Vec<Adjust>, Pitch); // No adjustments -> vec len 0
 
+#[derive(Debug, Clone)]
 enum Node {
     Play(Note),
     Fork(Vec<Node>)
 }
 
-#[derive(Default)]
+#[derive(Default, Debug, Clone)]
 struct Song {
     prefix: Vec<Adjust>, // TODO consider tinyvec
     score: Vec<Node>
@@ -259,20 +263,19 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
 
 // Translate PT to AT
 fn absolute_language(s:Song) -> Song {
-    fn fit_range(x:i32) -> i32 {
-        x.clamp(0,127)
-    }
     fn absolute_node(node:Node) -> Node {
-        match node {
-            Node::Play((adjust, pitch)) => {
-                Node::Play((adjust, match pitch {
-                    Pitch::Rest => Pitch::Abs(0),
-                    Pitch::Rel(x) => Pitch::Abs(fit_range(x + 69 - 12)), // TODO: Remove -12 when it's easier to shift octave
-                    Pitch::Abs(x) => Pitch::Abs(fit_range(x))
-                }))
-            },
-            Node::Fork(all) => Node::Fork(all.into_iter().map(absolute_node).collect())
-        }
+        // TODO: I don't want this anymore. I do want () scanned
+        // match node {
+        //     Node::Play((adjust, pitch)) => {
+        //         Node::Play((adjust, match pitch {
+        //             Pitch::Rest => Pitch::Abs(0),
+        //             Pitch::Rel(x) => Pitch::Abs(fit_range(x + 69 - 12)), // TODO: Remove -12 when it's easier to shift octave
+        //             Pitch::Abs(x) => Pitch::Abs(fit_range(x))
+        //         }))
+        //     },
+        //     Node::Fork(all) => Node::Fork(all.into_iter().map(absolute_node).collect())
+        // }
+        node
     }
 
     // Todo: Surf prefix for note offsets
@@ -981,9 +984,9 @@ where
         root:i32,        // Base note ('notes' index)
         pitch:i32,       // Pitch (index relative to base note)
         rate:i32,        // Note length (samples)
-//        duty:i32,        // For what portion of the note is it "held"? (subsamples)
-//        duty_vs:i32,     // Radix of duty (scalar)
-//        duty_subsample_cache:i32
+        duty:i32,        // For what portion of the note is it "held"? (per vs)
+        duty_vs:i32,     // Radix of duty (scalar)
+        duty_as_sample_cache:i32, // duty converted to samples
     }
     #[derive(Debug, Clone)]
     struct PlayState {
@@ -1005,13 +1008,16 @@ where
     const BPM:i32 = 110;
     const SQUARE_RADIX:i32 = 32; // "Subsample" fixed point for better pitch accuracy
     const REST_NODE:Node = Node::Play((vec![], Pitch::Abs(0)));
+    const DEFAULT_RATE:i32 = (60.0*48000.0/(BPM as f64)/4.0) as i32;
     const DEFAULT_ADJUST:AdjustState = AdjustState {
-        root:69-12, pitch:0, rate:(60.0*48000.0/(BPM as f64)/4.0) as i32,
-        //duty:8, duty_vs:8
+        root:69-12, pitch:0, rate:DEFAULT_RATE, duty:8, duty_vs:8, duty_as_sample_cache:DEFAULT_RATE
     };
     const DEFAULT_PLAY:PlayState = PlayState {
         synth_at: 0, synth_high:false, sample_at:0, beat_at:0
     };
+    fn fit_range(x:i32) -> i32 {
+        x.clamp(0,127)
+    }
 
 // FIXME: sample_rate is really pretty important. Currently 44100 is assumed.
 //    let sample_rate = config.sample_rate.0 as f32;
@@ -1058,33 +1064,102 @@ where
         // Check for new instructions from processing thread
         if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
             song = *new_song;
+            //eprintln!("{:#?}", song.clone());
             if song.score.len() == 0 {
                 song.score.push(REST_NODE);
             }
         }
 
         // Check for end of note
+        let mut need_adjustment = false;
         if state.play.sample_at > state.adjust.rate {
             state.play.beat_at += 1;
             state.play.sample_at = 0;
-            // TODO: Adjustments here
+
+            // Cancel out square wave "overrun" (already dubious)
+            if state.adjust.duty < state.adjust.duty_vs {
+                state.play.synth_at = 0;
+                state.play.synth_high = !state.play.synth_high;
+            }
+
+            need_adjustment = true;
         }
         // Check for end of song (loop)
         // Do this outside previous if because song can be replaced "under us"
         if state.play.beat_at >= song.score.len() {
             state.play.beat_at = 0;
+
+            state.adjust = DEFAULT_ADJUST; // Implicit reset each loop. Consider making customizable?
+            need_adjustment = true;
         }
 
         // What note are we playing?
+        // FIXME: There are bugs here:
+        // - pitch adjustments always apply relative to 69-12 rather than current value.
+        // - tempo adjustments tend to result in the note being skipped, somehow.
+        let note = &song.score[state.play.beat_at];
+        if need_adjustment {
+            match &song.score[state.play.beat_at] {
+                Node::Play((v, _)) => {
+                    for adjust in v {
+                        match adjust {
+                            Adjust::Pitch(act, _) => match act {
+                                Act::Set(x) => state.adjust.root = *x,
+                                Act::Increment(x) =>  state.adjust.root += *x,
+                                Act::Double(x) => state.adjust.root += *x * 12,
+                                Act::Versus(_) => todo!(),
+                            },
+                            Adjust::Tempo(act) => {
+                                match act {
+                                    Act::Set(x) => state.adjust.rate = *x,
+                                    Act::Increment(_) => todo!(),
+                                    Act::Double(x) => if *x > 0 {
+                                            state.adjust.rate *= *x;
+                                        } else {
+                                            state.adjust.rate /= -*x;
+                                        },
+                                    Act::Versus(_) => todo!(),
+                                }
+                                state.adjust.duty_as_sample_cache = state.adjust.duty * state.adjust.rate / state.adjust.duty_vs;
+                            },
+                            Adjust::Duty(act) => {
+                                match act {
+                                    Act::Set(x) => state.adjust.duty = *x,
+                                    Act::Increment(x) => state.adjust.duty += *x,
+                                    Act::Double(x) => if *x > 0 {
+                                        state.adjust.rate *= *x;
+                                    } else {
+                                        state.adjust.rate /= -*x;
+                                    },
+                                    Act::Versus(x) => {
+                                        // Kludge?: Rescale duty to duty_vs
+                                        state.adjust.duty *= state.adjust.duty_vs;
+                                        state.adjust.duty_vs = *x;
+                                        state.adjust.duty /= state.adjust.duty_vs;
+                                        state.adjust.duty = state.adjust.duty.max(1);
+                                    },
+                                }
+                                state.adjust.duty = state.adjust.duty.min(state.adjust.duty_vs);
+                                state.adjust.duty_as_sample_cache = state.adjust.duty * state.adjust.rate / state.adjust.duty_vs;
+                            },
+                            Adjust::Reset => state.adjust = DEFAULT_ADJUST,
+                        }
+                    }
+                },
+                _ => unreachable!()
+            }
+        }
         let pitch_index = match &song.score[state.play.beat_at] {
-            Node::Play((v, Pitch::Abs(x))) if v.len()==0 => *x,
+            Node::Play((_, Pitch::Abs(x))) => fit_range(*x), // Never generated?
+            Node::Play((_, Pitch::Rel(x))) => fit_range(*x + state.adjust.root),
+            Node::Play((_, Pitch::Rest)) => 0,
             _ => unreachable!()
         };
         // Map note->synth zero crossing peroid
         let period = notes[pitch_index as usize];
 
         // Time for synth zero crossing?
-        if state.play.synth_at > period {
+        if state.play.sample_at < state.adjust.duty_as_sample_cache && state.play.synth_at > period {
             state.play.synth_high = !state.play.synth_high;
             state.play.synth_at -= period;
         }
