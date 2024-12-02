@@ -975,9 +975,7 @@ fn audio_run<T>(device: &cpal::Device, config: &cpal::StreamConfig, audio_additi
 where
     T: SizedSample + FromSample<f32> + bytemuck::Pod, /* Pod constraint can be removed without audio_log */
 {
-//    struct Frame {
-//
-//    }
+    // Types for audio engine
     #[derive(Debug, Clone)]
     struct AdjustState {
         root:i32,        // Base note ('notes' index)
@@ -1003,6 +1001,7 @@ where
         play:PlayState
     }
 
+    // Constants for audio engine
     const BPM:i32 = 110;
     const SQUARE_RADIX:i32 = 32; // "Subsample" fixed point for better pitch accuracy
     const REST_NODE:Node = Node::Play((vec![], Pitch::Abs(0)));
@@ -1014,18 +1013,21 @@ where
         synth_at: 0, synth_high:false, sample_at:0, beat_at:0
     };
 
+// FIXME: sample_rate is really pretty important. Currently 44100 is assumed.
 //    let sample_rate = config.sample_rate.0 as f32;
     let channels = config.channels as usize;
     let mut state = State {adjust: DEFAULT_ADJUST, play: DEFAULT_PLAY};
 
+    // Copy cross thread values into closure
     let audio_time = audio_additional.time.clone();
     let audio_playing = audio_additional.play.clone();
     let audio_song = audio_additional.song.clone();
 
+    // Can't have an empty song, so make a default one containing a single rest.
     let mut song:Song = Default::default();
-    song.score.push(REST_NODE); // No empty
+    song.score.push(REST_NODE);
 
-    // FIXME: These are slightly detuned from the A440 I find on youtube
+    // Lookup table of MIDI note -> subsample zero-crossing period of square wave 
     let notes = {
         let mut notes:Vec<i32> = Default::default();
         let mut base_freq = 440.0 / 32.0;
@@ -1047,10 +1049,13 @@ where
         notes
     };
 
+    // Generate exactly 1 mono sample
     let mut next_value = move || {
+        // Move forward sample counters
         state.play.synth_at += SQUARE_RADIX;
         state.play.sample_at += 1;
 
+        // Check for new instructions from processing thread
         if let Some(new_song) = audio_song.swap(None, Ordering::AcqRel) {
             song = *new_song;
             if song.score.len() == 0 {
@@ -1058,31 +1063,40 @@ where
             }
         }
 
+        // Check for end of note
         if state.play.sample_at > state.adjust.rate {
             state.play.beat_at += 1;
             state.play.sample_at = 0;
+            // TODO: Adjustments here
         }
+        // Check for end of song (loop)
+        // Do this outside previous if because song can be replaced "under us"
         if state.play.beat_at >= song.score.len() {
             state.play.beat_at = 0;
         }
 
+        // What note are we playing?
         let pitch_index = match &song.score[state.play.beat_at] {
             Node::Play((v, Pitch::Abs(x))) if v.len()==0 => *x,
             _ => unreachable!()
         };
+        // Map note->synth zero crossing peroid
         let period = notes[pitch_index as usize];
 
+        // Time for synth zero crossing?
         if state.play.synth_at > period {
             state.play.synth_high = !state.play.synth_high;
             state.play.synth_at -= period;
         }
 
+        // Tell the processing thread where we're at
         audio_time.store(state.play.beat_at as u32, Ordering::Relaxed);
 
+        // Play sound
         if state.play.synth_high {
             0.25
         } else {
-            0.0
+            0.0 // TODO: This won't work with mixing. Fix zero_value below
         }
         // -- BOILERPLATE --
     };
