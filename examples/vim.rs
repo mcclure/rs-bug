@@ -1143,7 +1143,7 @@ where
             state.play.beat_at = 0;
 
             // FIXME: File a bug on what happens with this next line if you remove clone()
-            state.adjust = reset_adjust; // Implicit reset each loop. Consider making customizable?
+            state.adjust = reset_adjust.clone(); // Implicit reset each loop. Consider making customizable?
             need_adjustment = true;
         }
 
