@@ -187,24 +187,27 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
             .name("positive")
     }
 
-    fn act<'a>() -> Parser<'a, Act> {
-        (
-            (sym('v') * positive()).map(|x| Act::Versus(x))
+    fn act<'a>(set:bool) -> Parser<'a, Act> {
+        {
+            let mut p = (sym('v') * positive()).map(|x| Act::Versus(x))
             | (seq("++") * positive()).map(|x| Act::Double(x))
             | (seq("--") * positive()).map(|x| Act::Double(-x))
             | (sym('+') * positive()).map(|x| Act::Increment(x))
-            | (sym('-') * positive()).map(|x| Act::Increment(-x))
-            //| (sym('=') * positive()).map(|x| Act::Set(x)) // Maybe?
-        ).name("act")
+            | (sym('-') * positive()).map(|x| Act::Increment(-x));
+            if set {
+                p = p | positive().map(|x| Act::Set(x))
+            }
+            p
+        }.name("act")
     }
 
     fn adjust<'a>() -> Parser<'a, Adjust> {
         (
             sym('r').map(|_|Adjust::Reset)
-            | (sym('d') * act()).map(|act|Adjust::Duty(act))
-            | (sym('t') * act()).map(|act|Adjust::Tempo(act))
+            | (sym('d') * act(true)).map(|act|Adjust::Duty(act))
+            | (sym('t') * act(true)).map(|act|Adjust::Tempo(act))
             | (sym('p') * positive()).map(|x|Adjust::Pitch(Act::Set(x), true))
-            | (sym('p').opt() + act()).map(|(hard, act)|Adjust::Pitch(act, hard.is_some()))
+            | (sym('p').opt() + act(false)).map(|(hard, act)|Adjust::Pitch(act, hard.is_some()))
         ).name("adjust")
     }
 
