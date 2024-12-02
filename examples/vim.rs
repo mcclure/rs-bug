@@ -123,7 +123,8 @@ struct VimAudioSeed {
 // dNumber, d+Number, d++Number etc: set duty/duration (against basis of 8)
 // a&b: One, then the other
 
-// TODOs/consider: pv, dv; &&, &&&; !!, !; :;
+// TODOs/document: pv, dv; !
+// TODOs/consider: pr, dr; &&, &&&; !!, !; :;
 
 // In comments below: An //AT comment implies audio thread only, a //PT comment implies processing thread only
 // There are two forms of this AST, a "raw" form and a "clean" form, but they have the same type.
@@ -240,10 +241,17 @@ fn parse_language(input:String) -> Result<Song, pom::Error> { // FIXME: &String?
 
     // TODO: parser should produce a song
     let parser =
-        opt_space() *
-        (node() + (space() * node()).repeat(0..)).map(tuple_merge) - opt_space() - end()
+        (
+            opt_space() * sym('!') * opt_space() *
+            (adjust() + (one_of(" \t") * adjust()).repeat(0..)).map(tuple_merge)
+            - sym('\n')
+        ).repeat(0..).map(|v|v.into_iter().flatten().collect()) +
+        (
+            opt_space() *
+            (node() + (space() * node()).repeat(0..)).map(tuple_merge) - opt_space() - end()
+        )
     ;
-    parser.map(|score|Song {prefix: vec!(), score}).parse_str(&input)
+    parser.map(|(prefix, score)|Song {prefix, score}).parse_str(&input)
 }
 
 // Translate PT to AT
